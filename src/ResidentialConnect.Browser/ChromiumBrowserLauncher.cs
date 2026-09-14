@@ -62,22 +62,41 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
             var relay = _forwardingProxyFactory();
             var localPort = await relay.StartAsync(profile, password, cancellationToken).ConfigureAwait(false);
 
+            // Defense in depth: if the relay reports it is not actually up
+            // right after StartAsync returned a port (e.g. the accept loop
+            // crashed immediately - see LocalForwardingProxy.AcceptLoopAsync),
+            // never launch the browser at all. Launching anyway with a dead
+            // relay port is exactly the "silent direct-network bypass" risk
+            // this fix must prevent - Chromium would either fail every
+            // request outright (safe) or, in the worst case, some traffic
+            // could be routed around a half-started relay. Failing loudly
+            // here is the safer, explicit behavior.
+            if (!relay.IsRunning || relay.Port != localPort)
+            {
+                await relay.StopAsync().ConfigureAwait(false);
+                relay.Dispose();
+                _logger.Error("BrowserLauncher", "Local relay failed to start correctly; refusing to launch the browser to avoid an unproxied session.");
+                return BrowserLaunchResult.Failed("Failed to start the local proxy relay. The browser was not launched, to avoid it using your normal internet connection unproxied.");
+            }
+
+            // Dedicated, per-proxy-profile isolated user-data-dir. Using a
+            // GUID-based folder under the app's own local data root - never
+            // the user's real Chrome/Edge profile directory - guarantees this
+            // launch cannot collide with, or hand off to, the user's normal
+            // browser session.
             var profileDir = Path.Combine(AppPaths.BrowserProfilesDirectory, profile.Id.ToString("N"));
             Directory.CreateDirectory(profileDir);
 
-            var arguments = new List<string>
-            {
-                $"--proxy-server=127.0.0.1:{localPort}",
-                $"--user-data-dir=\"{profileDir}\"",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--new-window"
-            };
-
-            if (!string.IsNullOrWhiteSpace(startUrl))
-            {
-                arguments.Add(startUrl);
-            }
+            // IMPORTANT: ChromiumArgumentsBuilder.Build() returns RAW argument
+            // values. Do NOT wrap any of them in manual quote characters here
+            // - ProcessStartInfo.ArgumentList applies correct Win32 quoting
+            // automatically. Manually embedding quotes (the previous bug) is
+            // what caused Chrome to receive a corrupted --user-data-dir value,
+            // silently fall back to the user's real default profile, hand off
+            // to an already-running Chrome instance, and ignore --proxy-server
+            // entirely. See ChromiumArgumentsBuilder's class remarks for the
+            // full root-cause analysis.
+            var arguments = ChromiumArgumentsBuilder.Build(localPort, profileDir, startUrl);
 
             var startInfo = new ProcessStartInfo
             {
@@ -93,6 +112,7 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
             if (process is null)
             {
                 await relay.StopAsync().ConfigureAwait(false);
+                relay.Dispose();
                 return BrowserLaunchResult.Failed("Failed to start the browser process.");
             }
 
