@@ -1,0 +1,58 @@
+<Window x:Class="ResidentialConnect.Client.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Residential Connect" Height="420" Width="460"
+        WindowStartupLocation="CenterScreen" ResizeMode="CanMinimize">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Orientation="Horizontal" Grid.Row="0" HorizontalAlignment="Center" Margin="0,0,0,4">
+            <TextBlock x:Name="FlagText" Text="🌐" FontSize="34" Margin="0,0,10,0"/>
+            <StackPanel VerticalAlignment="Center">
+                <TextBlock x:Name="CountryText" Text="NO PROXY SELECTED" FontSize="18" FontWeight="Bold"/>
+                <TextBlock x:Name="CityText" Text="" FontSize="13" Foreground="Gray"/>
+            </StackPanel>
+        </StackPanel>
+
+        <TextBlock x:Name="StatusText" Grid.Row="1" Text="Status: Ready" FontSize="14"
+                   HorizontalAlignment="Center" Margin="0,10,0,10"/>
+
+        <Button x:Name="ConnectButton" Grid.Row="2" Content="CONNECT" Height="52" FontSize="18" FontWeight="Bold"
+                Click="ConnectButton_Click" Margin="0,0,0,14"/>
+
+        <Grid Grid.Row="3" Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0">
+                <TextBlock Text="Current IP" FontSize="11" Foreground="Gray"/>
+                <TextBlock x:Name="IpText" Text="—" FontSize="14" FontWeight="SemiBold"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1">
+                <TextBlock Text="Latency" FontSize="11" Foreground="Gray"/>
+                <TextBlock x:Name="LatencyText" Text="—" FontSize="14" FontWeight="SemiBold"/>
+            </StackPanel>
+        </Grid>
+
+        <Button x:Name="OpenBrowserButton" Grid.Row="4" Content="OPEN BROWSER" Height="40" FontSize="14"
+                Click="OpenBrowserButton_Click" Margin="0,10,0,10" IsEnabled="False"/>
+
+        <ComboBox x:Name="ProxyComboBox" Grid.Row="5" Height="30" Margin="0,0,0,10"
+                  SelectionChanged="ProxyComboBox_SelectionChanged" DisplayMemberPath="Name"/>
+
+        <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Center">
+            <Button x:Name="ManageProxiesButton" Content="Settings / Manage Proxies" Padding="10,4"
+                    Click="ManageProxiesButton_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

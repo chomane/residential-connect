@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ResidentialConnect.Core\ResidentialConnect.Core.csproj" />
+    <ProjectReference Include="..\ResidentialConnect.Security\ResidentialConnect.Security.csproj" />
+    <ProjectReference Include="..\ResidentialConnect.Proxy\ResidentialConnect.Proxy.csproj" />
+    <ProjectReference Include="..\ResidentialConnect.Browser\ResidentialConnect.Browser.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>ResidentialConnect</AssemblyName>
+    <RootNamespace>ResidentialConnect.Client</RootNamespace>
+    <Product>Residential Connect</Product>
+    <AssemblyTitle>Residential Connect</AssemblyTitle>
+    <Company>Residential Connect</Company>
+    <Version>0.1.0</Version>
+    <!-- Publish target for the Windows x64 release build (see docs/BUILD.md). -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+</Project>
