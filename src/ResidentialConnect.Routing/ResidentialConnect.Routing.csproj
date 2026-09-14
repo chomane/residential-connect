@@ -1,0 +1,34 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ResidentialConnect.Core\ResidentialConnect.Core.csproj" />
+    <ProjectReference Include="..\ResidentialConnect.Proxy\ResidentialConnect.Proxy.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Ships the official, unmodified WinDivert.dll (user-mode library) and
+      WinDivert64.sys (Windows driver) native binaries for win-x64 next to
+      the published .exe. WinDivert itself is dual-licensed LGPLv3/GPLv2
+      (https://github.com/basil00/WinDivert/blob/master/LICENSE); this
+      package (Native.WinDivert) redistributes those official binaries
+      unmodified - see docs/ARCHITECTURE.md "V0.2: Whole Computer routing"
+      for the licensing note required by LGPLv3 ss4/ss5.
+    -->
+    <PackageReference Include="Native.WinDivert" Version="2.2.2" />
+    <!--
+      Managed P/Invoke bindings over the native WinDivert API (WinDivertOpen/
+      Recv/Send/Close/HelperCalcChecksums/etc). Ships no native binaries of
+      its own - Native.WinDivert (above) supplies those.
+    -->
+    <PackageReference Include="Aigio.WinDivertSharp" Version="1.4.4.5" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+</Project>

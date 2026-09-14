@@ -57,3 +57,75 @@ public sealed class NullLogger : IAppLogger
 {
     public void Log(LogLevel level, string category, string message, Exception? exception = null) { }
 }
+
+/// <summary>Scriptable fake IProxyConnectivityTester so DefaultConnectionManager's mode-aware CONNECT flow can be tested without a real network call.</summary>
+public sealed class FakeProxyConnectivityTester : IProxyConnectivityTester
+{
+    public ProxyTestResult NextResult { get; set; } = ProxyTestResult.Successful("203.0.113.9", TimeSpan.FromMilliseconds(42));
+
+    public Task<ProxyTestResult> TestAsync(ProxyProfile profile, CancellationToken cancellationToken = default) => Task.FromResult(NextResult);
+}
+
+/// <summary>
+/// Scriptable fake ISystemTrafficRouter used to test DefaultConnectionManager's
+/// Whole Computer orchestration (start/stop calls, fail-closed status
+/// propagation, mode-gated bypass of the router entirely for Browser Only)
+/// without needing a real WinDivert handle/Windows kernel.
+/// </summary>
+public sealed class FakeSystemTrafficRouter : ISystemTrafficRouter
+{
+    public bool IsSupported { get; set; } = true;
+    public bool RequiresElevation => true;
+    public SystemRoutingStatus Status { get; private set; } = SystemRoutingStatus.Disabled;
+    public event EventHandler<SystemRoutingStatus>? StatusChanged;
+
+    public SystemRoutingStatus NextStartResult { get; set; } = SystemRoutingStatus.Active;
+    public int StartCallCount { get; private set; }
+    public int StopCallCount { get; private set; }
+    public string? LastPassword { get; private set; }
+
+    public Task<SystemRoutingStatus> StartAsync(ProxyProfile profile, string password, CancellationToken cancellationToken = default)
+    {
+        StartCallCount++;
+        LastPassword = password;
+        Status = NextStartResult;
+        StatusChanged?.Invoke(this, Status);
+        return Task.FromResult(Status);
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        StopCallCount++;
+        Status = SystemRoutingStatus.Disabled;
+        StatusChanged?.Invoke(this, Status);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Test hook to simulate an asynchronous fail-closed transition while already Active (e.g. the relay faulted).</summary>
+    public void SimulateFailClosed()
+    {
+        Status = SystemRoutingStatus.FailedClosed;
+        StatusChanged?.Invoke(this, Status);
+    }
+}
+
+/// <summary>
+/// Adds throw-on-start scripting to the existing <see cref="FakeSystemTrafficRouter"/>
+/// contract via extension-friendly properties would require modifying the
+/// sealed class above; instead, ConnectionManagerModeTests uses
+/// <see cref="FakeSystemTrafficRouter"/> directly (see its
+/// <c>NextStartResult</c>/<c>LastPassword</c> members above) and a small
+/// dedicated throwing fake for the one "StartAsync throws" scenario.
+/// </summary>
+public sealed class ThrowingSystemTrafficRouter : ISystemTrafficRouter
+{
+    public bool IsSupported => true;
+    public bool RequiresElevation => true;
+    public SystemRoutingStatus Status => SystemRoutingStatus.Disabled;
+    public event EventHandler<SystemRoutingStatus>? StatusChanged { add { } remove { } }
+
+    public Task<SystemRoutingStatus> StartAsync(ProxyProfile profile, string password, CancellationToken cancellationToken = default) =>
+        throw new InvalidOperationException("Simulated unexpected failure.");
+
+    public Task StopAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+}

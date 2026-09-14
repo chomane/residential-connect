@@ -5,6 +5,7 @@
     <ProjectReference Include="..\ResidentialConnect.Security\ResidentialConnect.Security.csproj" />
     <ProjectReference Include="..\ResidentialConnect.Proxy\ResidentialConnect.Proxy.csproj" />
     <ProjectReference Include="..\ResidentialConnect.Browser\ResidentialConnect.Browser.csproj" />
+    <ProjectReference Include="..\ResidentialConnect.Routing\ResidentialConnect.Routing.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

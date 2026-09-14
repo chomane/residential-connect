@@ -23,5 +23,14 @@ public sealed class ConnectionState
     public TimeSpan? Latency { get; init; }
     public string? StatusMessage { get; init; }
 
+    /// <summary>Which scope (Browser Only vs Whole Computer) this state reflects. See <see cref="ConnectionMode"/>.</summary>
+    public ConnectionMode Mode { get; init; } = ConnectionMode.BrowserOnly;
+
+    /// <summary>
+    /// Whole-computer routing sub-state. Always <see cref="SystemRoutingStatus.Disabled"/>
+    /// when <see cref="Mode"/> is <see cref="ConnectionMode.BrowserOnly"/>.
+    /// </summary>
+    public SystemRoutingStatus RoutingStatus { get; init; } = SystemRoutingStatus.Disabled;
+
     public static readonly ConnectionState Idle = new() { Status = ConnectionStatus.Ready, StatusMessage = "Ready" };
 }

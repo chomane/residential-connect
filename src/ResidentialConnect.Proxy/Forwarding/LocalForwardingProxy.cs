@@ -122,7 +122,7 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
         var okResponse = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
         await browserStream.WriteAsync(okResponse, cancellationToken).ConfigureAwait(false);
 
-        await RelayBidirectionalAsync(browserStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
+        await UpstreamRelayHelper.RelayBidirectionalAsync(browserStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
     }
 
     private async Task HandlePlainHttpAsync(NetworkStream browserStream, RawHttpRequest request, CancellationToken cancellationToken)
@@ -133,26 +133,7 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
         var upstreamStream = upstream.GetStream();
 
         await upstreamStream.WriteAsync(request.RawHeaderBytes, cancellationToken).ConfigureAwait(false);
-        await RelayBidirectionalAsync(browserStream, upstreamStream, cancellationToken).ConfigureAwait(false);
-    }
-
-    private static async Task RelayBidirectionalAsync(NetworkStream a, NetworkStream b, CancellationToken cancellationToken)
-    {
-        var t1 = CopyAsync(a, b, cancellationToken);
-        var t2 = CopyAsync(b, a, cancellationToken);
-        await Task.WhenAny(t1, t2).ConfigureAwait(false);
-    }
-
-    private static async Task CopyAsync(NetworkStream from, NetworkStream to, CancellationToken cancellationToken)
-    {
-        try
-        {
-            await from.CopyToAsync(to, 81920, cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            // Connection closed by either side - normal end-of-session.
-        }
+        await UpstreamRelayHelper.RelayBidirectionalAsync(browserStream, upstreamStream, cancellationToken).ConfigureAwait(false);
     }
 
     public Task StopAsync()
