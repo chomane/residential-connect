@@ -1,0 +1,12 @@
+<Application x:Class="ResidentialConnect.Client.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!--
+        No StartupUri here on purpose: App.xaml.cs.OnStartup builds the
+        MainWindow manually via the hand-rolled composition root (passing in
+        the repository/connection-manager/browser-launcher dependencies), so
+        WPF's default "construct StartupUri with a parameterless
+        constructor" mechanism cannot be used.
+    -->
+    <Application.Resources />
+</Application>

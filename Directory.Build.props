@@ -1,0 +1,17 @@
+<Project>
+  <PropertyGroup>
+    <!--
+      Allows building projects that target a Windows-specific TFM (e.g. net10.0-windows)
+      on non-Windows build agents (Linux CI, this sandbox, macOS dev machines).
+      This has NO effect when actually building on Windows - it only lifts the
+      cross-targeting restriction added by the .NET SDK for non-Windows hosts.
+      Real WPF UI still requires Windows to *run*; this only enables *compiling*
+      and running unit tests for the non-UI class libraries everywhere.
+    -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>
