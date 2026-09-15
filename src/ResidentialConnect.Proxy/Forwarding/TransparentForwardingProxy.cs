@@ -63,7 +63,7 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
 
         _connector = profile.Protocol switch
         {
-            ProxyProtocol.Http => new HttpConnectUpstreamConnector(profile.Host, profile.Port, profile.Username, password),
+            ProxyProtocol.Http => new HttpConnectUpstreamConnector(profile.Host, profile.Port, profile.Username, password, _logger),
             ProxyProtocol.Socks5 => new Socks5UpstreamConnector(profile.Host, profile.Port, profile.Username, password),
             _ => throw new NotSupportedException($"Protocol {profile.Protocol} not supported by the transparent forwarding proxy.")
         };
@@ -114,6 +114,8 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
         }
     }
 
+    private static readonly bool DiagnosticsEnabled = Environment.GetEnvironmentVariable("RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS") == "1";
+
     private async Task HandleClientAsync(TcpClient localClient, CancellationToken cancellationToken)
     {
         using var _ = localClient;
@@ -121,6 +123,12 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
         {
             localClient.NoDelay = true;
             var clientEndpoint = (IPEndPoint?)localClient.Client.RemoteEndPoint;
+
+            if (DiagnosticsEnabled)
+            {
+                _logger.Debug("RoutingDiagnostics", $"TransparentForwardingProxy accepted a redirected TCP connection from apparent peer {clientEndpoint}.");
+            }
+
             if (clientEndpoint is null || !_destinationResolver!.TryResolve(clientEndpoint, out var targetHost, out var targetPort))
             {
                 // Fail closed: no known original destination for this
@@ -129,12 +137,28 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
                 return;
             }
 
+            if (DiagnosticsEnabled)
+            {
+                _logger.Debug("RoutingDiagnostics", $"Resolved original destination for {clientEndpoint} -> {targetHost}:{targetPort}. Opening upstream tunnel.");
+            }
+
             var localStream = localClient.GetStream();
 
             TcpClient upstream;
             try
             {
                 upstream = await _connector!.ConnectAsync(targetHost, targetPort, cancellationToken).ConfigureAwait(false);
+
+                if (DiagnosticsEnabled)
+                {
+                    // The connector only returns successfully after the
+                    // upstream CONNECT/SOCKS5 handshake already reported
+                    // success (see HttpConnectUpstreamConnector /
+                    // Socks5UpstreamConnector - a non-200/non-success reply
+                    // throws before returning). No credentials are logged
+                    // here - only host:port and the fact that it succeeded.
+                    _logger.Debug("RoutingDiagnostics", $"Upstream tunnel to {targetHost}:{targetPort} established (CONNECT/handshake succeeded).");
+                }
             }
             catch (Exception ex) when (ex is IOException or SocketException or ProxyAuthenticationException)
             {
@@ -143,12 +167,25 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
                 // application's connection rather than ever letting it reach
                 // targetHost:targetPort directly.
                 _logger.Warning("TransparentForwardingProxy", $"Upstream proxy tunnel failed ({ex.GetType().Name}); closing redirected connection (fail-closed).");
+                if (DiagnosticsEnabled)
+                {
+                    _logger.Debug("RoutingDiagnostics", $"CONNECT/handshake to {targetHost}:{targetPort} FAILED: {DescribeExceptionChain(ex)}");
+                }
+
                 return;
             }
 
             using (upstream)
             {
-                await UpstreamRelayHelper.RelayBidirectionalAsync(localStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
+                if (DiagnosticsEnabled)
+                {
+                    var (bytesAppToUpstream, bytesUpstreamToApp) = await RelayBidirectionalWithByteCountsAsync(localStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
+                    _logger.Debug("RoutingDiagnostics", $"Redirected session to {targetHost}:{targetPort} ended. Bytes app->upstream={bytesAppToUpstream}, upstream->app={bytesUpstreamToApp}. (Payload contents and credentials are never logged.)");
+                }
+                else
+                {
+                    await UpstreamRelayHelper.RelayBidirectionalAsync(localStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
+                }
             }
         }
         catch (Exception ex) when (ex is IOException or SocketException)
@@ -158,7 +195,75 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
         catch (Exception ex)
         {
             _logger.Warning("TransparentForwardingProxy", $"Unexpected error handling redirected connection: {ex.GetType().Name}.");
+            if (DiagnosticsEnabled)
+            {
+                _logger.Debug("RoutingDiagnostics", $"Unexpected error detail: {DescribeExceptionChain(ex)}");
+            }
         }
+    }
+
+    /// <summary>
+    /// Diagnostic-only variant of <see cref="UpstreamRelayHelper.RelayBidirectionalAsync"/>
+    /// that additionally counts bytes copied in each direction, WITHOUT ever
+    /// logging or returning the actual payload bytes/content. Only used when
+    /// <see cref="DiagnosticsEnabled"/> is true.
+    /// </summary>
+    private static async Task<(long BytesAToB, long BytesBToA)> RelayBidirectionalWithByteCountsAsync(NetworkStream a, NetworkStream b, CancellationToken cancellationToken)
+    {
+        long bytesAToB = 0;
+        long bytesBToA = 0;
+
+        async Task CopyCountingAsync(NetworkStream from, NetworkStream to, Action<long> addBytes)
+        {
+            var buffer = new byte[81920];
+            try
+            {
+                while (true)
+                {
+                    var read = await from.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    addBytes(read);
+                    await to.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch
+            {
+                // Connection closed by either side - normal end-of-session.
+            }
+        }
+
+        var t1 = CopyCountingAsync(a, b, n => Interlocked.Add(ref bytesAToB, n));
+        var t2 = CopyCountingAsync(b, a, n => Interlocked.Add(ref bytesBToA, n));
+        await Task.WhenAny(t1, t2).ConfigureAwait(false);
+
+        return (Interlocked.Read(ref bytesAToB), Interlocked.Read(ref bytesBToA));
+    }
+
+    /// <summary>
+    /// Renders the full .NET exception chain (this exception plus every
+    /// <see cref="Exception.InnerException"/>) as a single diagnostic
+    /// string, for the routed-request TLS/connect failure investigation.
+    /// Messages are passed through <see cref="SecretScrubber.Scrub"/> (via
+    /// the logger's own scrubbing on write) so no credential-shaped text
+    /// survives even if a lower layer ever included one by mistake.
+    /// </summary>
+    internal static string DescribeExceptionChain(Exception ex)
+    {
+        var parts = new List<string>();
+        var current = ex;
+        var depth = 0;
+        while (current is not null && depth < 10)
+        {
+            parts.Add($"[{depth}] {current.GetType().FullName}: {current.Message}");
+            current = current.InnerException;
+            depth++;
+        }
+
+        return string.Join(" <-- ", parts);
     }
 
     public Task StopAsync()

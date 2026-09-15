@@ -32,6 +32,13 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        // Enable the temporary, verbose routing diagnostics (per-packet
+        // tuple/flag/direction logging, counters, CONNECT status, byte
+        // counts) in WinDivertSystemTrafficRouter / TransparentForwardingProxy
+        // / HttpConnectUpstreamConnector for the duration of this run only -
+        // this tool exists specifically to capture that output.
+        Environment.SetEnvironmentVariable("RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS", "1");
+
         Console.WriteLine("=== Residential Connect - Whole Computer routing diagnostic ===");
         Console.WriteLine("This tool automates the exact acceptance test from the");
         Console.WriteLine("2026-09-15 handoff: connect Whole Computer mode, make a real");
@@ -291,13 +298,35 @@ internal static class Program
         catch (HttpRequestException ex)
         {
             stopwatch.Stop();
-            return new RequestResult(false, $"{url} -> FAILED after {stopwatch.ElapsedMilliseconds}ms: {ex.GetType().Name}: {ex.Message}", null);
+            return new RequestResult(false, $"{url} -> FAILED after {stopwatch.ElapsedMilliseconds}ms.{Environment.NewLine}    Full exception chain: {DescribeExceptionChain(ex)}", null);
         }
         catch (Exception ex)
         {
             stopwatch.Stop();
-            return new RequestResult(false, $"{url} -> unexpected error after {stopwatch.ElapsedMilliseconds}ms: {ex.GetType().Name}: {ex.Message}", null);
+            return new RequestResult(false, $"{url} -> unexpected error after {stopwatch.ElapsedMilliseconds}ms.{Environment.NewLine}    Full exception chain: {DescribeExceptionChain(ex)}", null);
         }
+    }
+
+    /// <summary>
+    /// Renders the full .NET exception chain (the exception plus every
+    /// nested <see cref="Exception.InnerException"/>), so a routed-request
+    /// TLS/connect failure (e.g. "The SSL connection could not be
+    /// established") shows the actual underlying SocketException/Win32
+    /// error instead of just the outer wrapper message.
+    /// </summary>
+    private static string DescribeExceptionChain(Exception ex)
+    {
+        var parts = new List<string>();
+        var current = ex;
+        var depth = 0;
+        while (current is not null && depth < 10)
+        {
+            parts.Add($"[{depth}] {current.GetType().FullName}: {current.Message}");
+            current = current.InnerException;
+            depth++;
+        }
+
+        return string.Join(" <-- ", parts);
     }
 
     private static bool IsElevated()

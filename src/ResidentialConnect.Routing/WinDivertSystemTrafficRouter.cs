@@ -135,6 +135,24 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     private Task? _forwardLoopTask;
     private Task? _returnLoopTask;
 
+    // --- Temporary diagnostic instrumentation (2026-09-15) ---------------
+    // Added to pin down exactly where the reflected TCP flow breaks down
+    // after the reflection fix turned a hard timeout into a TLS handshake
+    // failure ("The SSL connection could not be established"). Verbose
+    // per-packet logging is OFF by default (so the shipped desktop app is
+    // never noisy) and only turns on when the
+    // RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS environment variable is "1" -
+    // tools/ResidentialConnect.RoutingDiagnostic sets this for its own
+    // process automatically. The four counters below are always maintained
+    // (cheap Interlocked increments) and always summarized once, at Info
+    // level, when routing stops, regardless of the verbose flag.
+    private readonly bool _diagnosticsEnabled;
+    private long _forwardCaptureCount;
+    private long _returnCaptureCount;
+    private long _successfulReinjectionCount;
+    private long _sendFailureCount;
+    // -----------------------------------------------------------------------
+
     public WinDivertSystemTrafficRouter(
         IAppLogger logger,
         Func<ITransparentForwardingProxy> relayFactory,
@@ -154,6 +172,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         _relayFactory = relayFactory ?? throw new ArgumentNullException(nameof(relayFactory));
         _stateMarker = stateMarker ?? throw new ArgumentNullException(nameof(stateMarker));
         _flowTable = flowTable ?? throw new ArgumentNullException(nameof(flowTable));
+        _diagnosticsEnabled = Environment.GetEnvironmentVariable("RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS") == "1";
     }
 
     public bool IsSupported => OperatingSystem.IsWindows() && IsCurrentProcessElevated();
@@ -189,6 +208,10 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
 
         SetStatus(SystemRoutingStatus.Starting);
         _failClosed = false;
+        Interlocked.Exchange(ref _forwardCaptureCount, 0);
+        Interlocked.Exchange(ref _returnCaptureCount, 0);
+        Interlocked.Exchange(ref _successfulReinjectionCount, 0);
+        Interlocked.Exchange(ref _sendFailureCount, 0);
 
         try
         {
@@ -288,6 +311,8 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             _relay = null;
         }
 
+        _logger.Info("WinDivertSystemTrafficRouter", $"Routing diagnostics summary: forwardCaptures={Interlocked.Read(ref _forwardCaptureCount)}, returnCaptures={Interlocked.Read(ref _returnCaptureCount)}, successfulReinjections={Interlocked.Read(ref _successfulReinjectionCount)}, sendFailures={Interlocked.Read(ref _sendFailureCount)}.");
+
         _flowTable.Clear();
         _cts?.Dispose();
         _cts = null;
@@ -357,6 +382,8 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
                             break;
                         }
 
+                        var recvError = Marshal.GetLastWin32Error();
+                        _logger.Warning("RoutingDiagnostics", $"WinDivertRecv failed on the forward handle (Win32 error {recvError}).");
                         continue;
                     }
 
@@ -404,6 +431,8 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
                             break;
                         }
 
+                        var recvError = Marshal.GetLastWin32Error();
+                        _logger.Warning("RoutingDiagnostics", $"WinDivertRecv failed on the return handle (Win32 error {recvError}).");
                         continue;
                     }
 
@@ -436,16 +465,35 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         }
 
         var captured = CapturePacket(ip, tcp);
+        var captureNumber = Interlocked.Increment(ref _forwardCaptureCount);
+
+        if (_diagnosticsEnabled)
+        {
+            var directionBefore = address->Outbound ? "Outbound" : "Inbound";
+            _logger.Debug("RoutingDiagnostics", $"[FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
+        }
 
         var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayPort, _failClosed);
         if (!decision.ShouldReflect)
         {
             // Fail closed: captured traffic is not resent directly.
+            if (_diagnosticsEnabled)
+            {
+                _logger.Debug("RoutingDiagnostics", $"[FORWARD #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
+            }
+
             return;
         }
 
         ApplyReflection(ip, tcp, address, decision);
-        RecalculateAndSend(handle, packetBuffer, recvLen, address, "forward");
+
+        if (_diagnosticsEnabled)
+        {
+            var directionAfter = address->Outbound ? "Outbound" : "Inbound";
+            _logger.Debug("RoutingDiagnostics", $"[FORWARD #{captureNumber}] reflected -> {decision.NewSrcAddr}:{decision.NewSrcPort} -> {decision.NewDstAddr}:{decision.NewDstPort} direction-after={directionAfter}");
+        }
+
+        RecalculateAndSend(handle, packetBuffer, recvLen, address, "forward", captured, captureNumber);
     }
 
     private unsafe void ProcessReturnPacket(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address)
@@ -456,15 +504,45 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         }
 
         var captured = CapturePacket(ip, tcp);
+        var captureNumber = Interlocked.Increment(ref _returnCaptureCount);
+
+        if (_diagnosticsEnabled)
+        {
+            var directionBefore = address->Outbound ? "Outbound" : "Inbound";
+            _logger.Debug("RoutingDiagnostics", $"[RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
+        }
 
         var decision = PacketRedirectPlanner.PlanReturn(captured, _flowTable, _failClosed);
         if (!decision.ShouldReflect)
         {
+            if (_diagnosticsEnabled)
+            {
+                _logger.Debug("RoutingDiagnostics", $"[RETURN #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
+            }
+
             return;
         }
 
         ApplyReflection(ip, tcp, address, decision);
-        RecalculateAndSend(handle, packetBuffer, recvLen, address, "return");
+
+        if (_diagnosticsEnabled)
+        {
+            var directionAfter = address->Outbound ? "Outbound" : "Inbound";
+            _logger.Debug("RoutingDiagnostics", $"[RETURN #{captureNumber}] reflected -> {decision.NewSrcAddr}:{decision.NewSrcPort} -> {decision.NewDstAddr}:{decision.NewDstPort} direction-after={directionAfter}");
+        }
+
+        RecalculateAndSend(handle, packetBuffer, recvLen, address, "return", captured, captureNumber);
+    }
+
+    /// <summary>Renders which of SYN/ACK/FIN/RST are set on a captured packet, for diagnostic logging only.</summary>
+    private static string DescribeTcpFlags(CapturedTcpPacket packet)
+    {
+        var flags = new List<string>(4);
+        if (packet.IsSyn) flags.Add("SYN");
+        if (packet.IsAck) flags.Add("ACK");
+        if (packet.IsFin) flags.Add("FIN");
+        if (packet.IsRst) flags.Add("RST");
+        return flags.Count == 0 ? "-" : string.Join(",", flags);
     }
 
     private static unsafe CapturedTcpPacket CapturePacket(WinDivertNative.IPv4Header* ip, WinDivertNative.TcpHeader* tcp)
@@ -499,22 +577,33 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         WinDivertNative.MarkInbound(address);
     }
 
-    private unsafe void RecalculateAndSend(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address, string legName)
+    private unsafe void RecalculateAndSend(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address, string legName, CapturedTcpPacket captured, long captureNumber)
     {
         // flags == 0 means recalculate all applicable checksums.
         if (!WinDivertNative.CalcChecksums(packetBuffer, recvLen, address, 0))
         {
+            var checksumError = Marshal.GetLastWin32Error();
+            Interlocked.Increment(ref _sendFailureCount);
             _failClosed = true;
-            _logger.Error("WinDivertSystemTrafficRouter", $"WinDivert checksum recalculation failed on the {legName} leg; failing closed.", new InvalidOperationException($"Win32 error {Marshal.GetLastWin32Error()}."));
+            _logger.Error("RoutingDiagnostics", $"WinDivertHelperCalcChecksums failed on the {legName} leg (#{captureNumber}, {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort}); failing closed. Win32 error {checksumError}.", new InvalidOperationException($"Win32 error {checksumError}."));
             SetStatus(SystemRoutingStatus.FailedClosed);
             return;
         }
 
         if (!WinDivertNative.Send(handle, packetBuffer, recvLen, out _, address))
         {
+            var sendError = Marshal.GetLastWin32Error();
+            Interlocked.Increment(ref _sendFailureCount);
             _failClosed = true;
-            _logger.Error("WinDivertSystemTrafficRouter", $"WinDivert packet reinjection failed on the {legName} leg; failing closed.", new InvalidOperationException($"Win32 error {Marshal.GetLastWin32Error()}."));
+            _logger.Error("RoutingDiagnostics", $"WinDivertSend failed on the {legName} leg (#{captureNumber}, {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort}); failing closed. Win32 error {sendError}.", new InvalidOperationException($"Win32 error {sendError}."));
             SetStatus(SystemRoutingStatus.FailedClosed);
+            return;
+        }
+
+        Interlocked.Increment(ref _successfulReinjectionCount);
+        if (_diagnosticsEnabled)
+        {
+            _logger.Debug("RoutingDiagnostics", $"[{legName.ToUpperInvariant()} #{captureNumber}] reinjected successfully.");
         }
     }
 
