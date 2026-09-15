@@ -16,12 +16,26 @@ public class BypassFilterBuilderTests
     private const int RelayPort = 34010;
 
     [Fact]
-    public void BuildForwardFilter_ExcludesImpostorAndLoopback_ToPreventReinterceptionLoops()
+    public void BuildForwardFilter_ExcludesLoopback_ButNotImpostor_ToPreventReinterceptionLoopsWithoutBlockingTheClientsHandshakeCompletingAck()
     {
+        // 2026-09-15 fix: an isolated single-handle "streamdump parity"
+        // diagnostic (tools/ResidentialConnect.StreamdumpParity) proved on
+        // real Windows hardware that the client's own final ACK completing
+        // a reflected TCP handshake is itself captured with Impostor=True -
+        // WinDivert's Impostor flag is a flow-provenance marker (this
+        // flow's SYN was itself injected), not a "this exact packet was
+        // re-sent unchanged" marker. Excluding !impostor here silently
+        // discarded that ACK on every single redirected connection, so
+        // TransparentForwardingProxy's AcceptTcpClientAsync could never
+        // complete. Loop prevention instead relies on direction (this
+        // filter requires "outbound"; every packet this router itself
+        // reflects is explicitly marked Inbound before re-injection - see
+        // BypassFilterBuilder class remarks) plus PacketRedirectPlanner's
+        // own flow-table gate - not a blanket impostor exclusion.
         var filter = BypassFilterBuilder.BuildForwardFilter(new[] { IPAddress.Parse("198.51.100.10") }, 8080, RelayPort);
 
         Assert.Contains("!loopback", filter);
-        Assert.Contains("!impostor", filter);
+        Assert.DoesNotContain("!impostor", filter);
         Assert.Contains("outbound", filter);
         Assert.Contains("tcp", filter);
     }

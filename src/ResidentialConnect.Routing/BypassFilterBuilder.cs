@@ -29,6 +29,62 @@ namespace ResidentialConnect.Routing;
 /// residential proxy endpoint while Whole Computer mode is active.
 /// </para>
 /// <para>
+/// <b>Why the forward filter does NOT exclude impostor packets (2026-09-15
+/// fix):</b> an earlier revision of this filter included <c>!impostor</c>,
+/// on the (reasonable-sounding, but empirically wrong for this specific
+/// reflection technique) assumption that excluding every impostor-flagged
+/// packet was a safe, simple way to prevent re-interception loops of our
+/// own injected traffic. A dedicated, isolated single-handle "streamdump
+/// parity" diagnostic - completely independent of this
+/// router/relay/flow-table code, see
+/// <c>tools/ResidentialConnect.StreamdumpParity</c> - proved on real
+/// Windows hardware that the client's own final ACK (the packet that
+/// completes the reflected TCP 3-way handshake, and which
+/// <c>TransparentForwardingProxy</c>'s <c>AcceptTcpClientAsync</c> cannot
+/// return without) is itself captured with <c>Impostor</c> set, even though
+/// it is a genuine, newly-generated packet from the client machine's own
+/// TCP/IP stack, not a re-injected duplicate of anything WinDivert itself
+/// sent. This matches WinDivert's documented Impostor semantics: once a
+/// TCP flow's SYN was itself an injected/reflected packet, later genuine
+/// packets belonging to that SAME flow keep being tagged Impostor for the
+/// life of the connection - it is a flow-provenance marker, not a
+/// "this exact byte sequence was re-sent unchanged" marker.
+/// <c>!impostor</c> in the forward filter was therefore silently discarding
+/// the one packet needed to ever complete a redirected handshake, exactly
+/// explaining the previously-observed symptom: SYN reflected, relay
+/// generates a SYN-ACK, SYN-ACK reflected to the client, but the client's
+/// completing ACK never reached user mode at all, so
+/// <c>TransparentForwardingProxy</c> never saw a completed connection to
+/// accept.
+/// </para>
+/// <para>
+/// <b>Why removing the impostor exclusion here does NOT reopen a
+/// re-interception loop:</b> loop prevention for this router's own
+/// injected traffic does not rely on the impostor flag at all - it relies
+/// on the Outbound/Inbound direction flip that is the core of the
+/// reflection technique itself (see <see cref="PacketRedirectPlanner"/>
+/// remarks). Every packet THIS router reflects and re-sends (both the
+/// forward leg's SYN and the return leg's SYN-ACK/data) is explicitly
+/// marked Inbound before re-injection (see
+/// <see cref="WinDivertNative.MarkInbound"/>). Both this forward filter
+/// and <see cref="BuildReturnFilter"/> require <c>outbound</c> - an
+/// already-Inbound packet can never match either filter's base condition
+/// again, regardless of its impostor flag, so this router's own
+/// reflected/re-injected packets are structurally impossible to
+/// re-capture and re-process a second time. The packets this relaxation
+/// newly allows through are exclusively genuine, new, real Outbound
+/// packets generated fresh by the local machine's own TCP/IP stack (the
+/// client's completing ACK, and any of its later data/FIN packets) - and
+/// <see cref="PacketRedirectPlanner.PlanForward"/> still fail-closed drops
+/// any such packet whose source port is not either a brand-new SYN or an
+/// already-tracked flow in <see cref="RedirectFlowTable"/>, so this
+/// relaxation cannot cause an untracked or unrelated impostor packet to be
+/// reflected either. In short: direction (Outbound-only capture plus
+/// mandatory Inbound re-injection) combined with the existing flow-table
+/// gate in <see cref="PacketRedirectPlanner"/> - not a blanket impostor
+/// exclusion clause - are what actually prevent loops here.
+/// </para>
+/// <para>
 /// The forward filter ALSO excludes any packet whose SOURCE port is the
 /// local relay's own listening port (<c>tcp.SrcPort != relayPort</c>). This
 /// is required by the packet-reflection redirect technique (see
@@ -63,10 +119,15 @@ public static class BypassFilterBuilder
 {
     /// <summary>
     /// Builds the filter for the FORWARD capture handle: real, non-loopback
-    /// outbound TCP traffic, excluding our own re-injected packets
-    /// (<c>impostor</c>), excluding traffic to the upstream proxy itself,
-    /// and excluding the local relay's own reply traffic (see class
-    /// remarks for why the latter is required by the reflection technique).
+    /// outbound TCP traffic, excluding traffic to the upstream proxy itself
+    /// and the local relay's own reply traffic (see class remarks for why
+    /// the latter is required by the reflection technique). Deliberately
+    /// does NOT exclude <c>impostor</c> packets - see class remarks
+    /// "Why the forward filter does NOT exclude impostor packets" for the
+    /// 2026-09-15 evidence (an isolated streamdump-parity diagnostic) that
+    /// the client's own handshake-completing ACK for a reflected flow is
+    /// itself flagged Impostor, and excluding it silently prevented every
+    /// redirected TCP connection from ever completing its 3-way handshake.
     /// </summary>
     public static string BuildForwardFilter(IReadOnlyCollection<IPAddress> proxyIPv4Addresses, int proxyPort, int relayPort)
     {
@@ -96,7 +157,7 @@ public static class BypassFilterBuilder
                 "Cannot build the whole-computer traffic filter without at least one resolved IPv4 address for the upstream proxy host - refusing to start (fail-closed).");
         }
 
-        var baseFilter = "outbound and !loopback and !impostor and tcp";
+        var baseFilter = "outbound and !loopback and tcp";
         var relayExclusion = $"tcp.SrcPort != {relayPort.ToString(CultureInfo.InvariantCulture)}";
         var proxyExclusions = ipv4.Select(ip =>
             $"(tcp.DstPort != {proxyPort.ToString(CultureInfo.InvariantCulture)} or ip.DstAddr != {ip})");

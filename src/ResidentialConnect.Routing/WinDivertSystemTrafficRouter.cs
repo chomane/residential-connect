@@ -590,7 +590,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionBefore = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore} Impostor={address->Impostor}");
         }
 
         var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayPort, _failClosed);
@@ -629,7 +629,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionBefore = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore} Impostor={address->Impostor}");
         }
 
         var decision = PacketRedirectPlanner.PlanReturn(captured, _flowTable, _failClosed);
