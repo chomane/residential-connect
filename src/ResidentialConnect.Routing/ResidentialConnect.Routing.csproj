@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\ResidentialConnect.Core\ResidentialConnect.Core.csproj" />
@@ -14,14 +14,20 @@
       package (Native.WinDivert) redistributes those official binaries
       unmodified - see docs/ARCHITECTURE.md "V0.2: Whole Computer routing"
       for the licensing note required by LGPLv3 ss4/ss5.
+
+      IMPORTANT: WinDivertNative.cs in this project calls the native API
+      DIRECTLY via P/Invoke rather than through a third-party managed
+      wrapper package. An earlier revision used Aigio.WinDivertSharp, whose
+      WinDivertAddress struct is only 24 bytes; the real WinDivert 2.2.2
+      WINDIVERT_ADDRESS is 80 bytes. That size mismatch is a credible root
+      cause of coreclr.dll access-violation crashes observed during live
+      Windows testing. Do not reintroduce Aigio.WinDivertSharp or any other
+      third-party WinDivert wrapper without re-verifying its native address
+      struct size against whatever WinDivert version is actually bundled -
+      see WinDivertNative.ValidateAbi(), which is called once before any
+      handle is opened specifically to catch this class of bug early.
     -->
     <PackageReference Include="Native.WinDivert" Version="2.2.2" />
-    <!--
-      Managed P/Invoke bindings over the native WinDivert API (WinDivertOpen/
-      Recv/Send/Close/HelperCalcChecksums/etc). Ships no native binaries of
-      its own - Native.WinDivert (above) supplies those.
-    -->
-    <PackageReference Include="Aigio.WinDivertSharp" Version="1.4.4.5" />
   </ItemGroup>
 
   <PropertyGroup>

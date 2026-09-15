@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -6,7 +7,6 @@ using System.Security.Principal;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
-using WinDivertSharp;
 
 namespace ResidentialConnect.Routing;
 
@@ -14,76 +14,68 @@ namespace ResidentialConnect.Routing;
 /// <see cref="ISystemTrafficRouter"/> implementation for V0.2, built on
 /// <a href="https://reqrypt.org/windivert.html">WinDivert</a> - a mature,
 /// widely-used, dual-licensed (LGPLv3/GPLv2) Windows kernel driver + user-mode
-/// library for capturing, modifying, and re-injecting network packets,
-/// accessed here via the <c>Aigio.WinDivertSharp</c> managed P/Invoke wrapper
-/// and the <c>Native.WinDivert</c> package (which ships the official,
-/// unmodified <c>WinDivert.dll</c>/<c>WinDivert64.sys</c> binaries). WinDivert
-/// was chosen, per the product requirement, specifically to AVOID inventing a
-/// custom network driver/protocol - it is the standard, proven component the
-/// Windows community already uses for exactly this "system-wide transparent
-/// proxy redirect" use case (the same fundamental technique used by numerous
-/// public WinDivert-based proxy tools).
+/// library for capturing, modifying, and re-injecting network packets. This
+/// router calls the official native WinDivert 2.2.2 API directly (see
+/// <see cref="WinDivertNative"/>) via the <c>Native.WinDivert</c> package
+/// (which ships the official, unmodified <c>WinDivert.dll</c>/<c>WinDivert64.sys</c>
+/// binaries) rather than through a third-party managed wrapper - see
+/// <see cref="WinDivertNative"/>'s remarks for why. WinDivert was chosen, per
+/// the product requirement, specifically to AVOID inventing a custom network
+/// driver/protocol - it is the standard, proven component the Windows
+/// community already uses for exactly this "system-wide transparent proxy
+/// redirect" use case (the same fundamental technique used by numerous
+/// public WinDivert-based proxy tools, and documented by WinDivert's own
+/// <c>streamdump.c</c> example).
 /// </summary>
 /// <remarks>
-/// <para><b>How interception/redirection actually works</b> (the "NAT" pattern):</para>
+/// <para><b>How interception/redirection actually works (the "reflection" pattern):</b></para>
 /// <list type="number">
-/// <item>Three WinDivert handles are opened at <see cref="WinDivertLayer.Network"/>
-/// (the only layer that can both capture AND re-inject modified packets -
-/// <see cref="WinDivertLayer.Forward"/> is for transit/routed traffic, not
-/// traffic to/from the local machine itself, and is explicitly documented as
-/// not mixing well with NAT-style rewriting):
+/// <item>Three WinDivert handles are opened at <see cref="WinDivertNative.Layer.Network"/>
+/// (the only layer that can both capture AND re-inject modified packets):
 ///   <list type="bullet">
 ///   <item>A <b>DNS-block handle</b> (see <see cref="DnsLeakGuard"/>) opened
-///   with <see cref="WinDivertOpenFlags.Drop"/> - the driver itself silently
-///   drops matching packets in-kernel; nothing is ever delivered to user
-///   mode. This alone is V0.2's entire DNS leak protection.</item>
+///   with <see cref="WinDivertNative.OpenFlags.Drop"/> - the driver itself
+///   silently drops matching packets in-kernel; nothing is ever delivered to
+///   user mode. This alone is V0.2's entire DNS leak protection.</item>
 ///   <item>A <b>forward handle</b> capturing real, non-loopback outbound TCP
 ///   traffic (<see cref="BypassFilterBuilder.BuildForwardFilter"/>), excluding
-///   our own re-injected packets (<c>!impostor</c>) and excluding traffic to
-///   the upstream proxy itself (the loop-prevention/self-exclusion rule).</item>
+///   our own re-injected packets (<c>!impostor</c>), traffic to the upstream
+///   proxy itself, and the local relay's own reply traffic (see that method's
+///   remarks for why the last exclusion is required).</item>
 ///   <item>A <b>return handle</b> capturing the local transparent relay's
 ///   own reply traffic back toward the redirected application
 ///   (<see cref="BypassFilterBuilder.BuildReturnFilter"/>).</item>
 ///   </list>
 /// </item>
-/// <item>For each captured forward packet, <see cref="PacketRedirectPlanner.PlanForward"/>
-/// decides whether to rewrite it. A brand-new SYN has its true destination
-/// recorded in <see cref="RedirectFlowTable"/> (keyed by the flow's client
-/// TCP port) and its packet header destination rewritten to
-/// <c>127.0.0.1:&lt;TransparentForwardingProxy port&gt;</c>; every subsequent
-/// packet of an already-tracked flow gets the identical rewrite re-applied
-/// (this is essential - rewriting only the SYN would not change what
-/// destination the application's own TCP stack keeps addressing every later
-/// packet to). Checksums are recalculated
-/// (<c>WinDivertHelperCalcChecksums</c>) and the packet is re-injected
-/// (<c>WinDivertSend</c>) on the SAME (outbound) direction.</item>
-/// <item>The rewritten packet's destination is now a local address, so
-/// Windows delivers it to <c>TransparentForwardingProxy</c>'s listening
-/// socket (bound to <see cref="IPAddress.Any"/>) exactly as if the
-/// application had dialed it directly - the accepted connection's remote
-/// endpoint (as the OS reports it to the relay) is still the untouched
-/// original client IP:port, which is exactly the key
-/// <see cref="RedirectFlowTable"/> (as <see cref="IOriginalDestinationResolver"/>)
-/// uses to tell the relay the ORIGINAL destination to actually tunnel to.</item>
-/// <item>For each captured return packet (the relay's own replies, now
-/// classified <c>loopback</c> because both endpoints are local machine
-/// addresses), <see cref="PacketRedirectPlanner.PlanReturn"/> rewrites the
-/// packet's SOURCE address/port to impersonate the real original
-/// destination the application believes it is talking to, recalculates
-/// checksums, and re-injects it - without this step the application's own
-/// TCP stack would reject the reply as not matching any connection it
-/// expects.</item>
+/// <item>
+/// For each captured forward/return packet, <see cref="PacketRedirectPlanner"/>
+/// decides whether/how to <b>reflect</b> it: swap source and destination
+/// address/port (recovering the piece of information the forward leg
+/// necessarily discards - the real destination port - from
+/// <see cref="RedirectFlowTable"/>), then flip the packet's direction from
+/// Outbound to Inbound (<see cref="WinDivertNative.MarkInbound"/>) before
+/// recalculating checksums and re-injecting it with <c>WinDivertSend</c>.
+/// See <see cref="RedirectDecision"/>'s remarks for the full worked example
+/// of both legs and, importantly, WHY a naive "just rewrite the destination,
+/// keep Outbound" approach (this router's own earlier, broken design) does
+/// not actually work - it is not a WinDivert-supported way to deliver a
+/// packet locally, and real Windows testing observed exactly the predicted
+/// symptom (traffic timing out / getting reset) until reflection was
+/// implemented.
+/// </item>
 /// </list>
-/// <para><b>Loop prevention:</b> two independent mechanisms combine to make
+/// <para><b>Loop prevention:</b> three independent mechanisms combine to make
 /// re-interception impossible: (a) every packet WinDivert itself re-injects
 /// is automatically tagged <c>impostor</c>, and both the forward and DNS
-/// filters explicitly exclude impostor packets; (b) the forward filter also
-/// excludes any packet addressed to the upstream proxy's own host:port
-/// (<see cref="BypassFilterBuilder"/> remarks) - this is what specifically
-/// satisfies "Residential Connect's own upstream proxy connection must
-/// bypass its own interception path", covering both the relay's per-flow
-/// tunnels AND this app's own connectivity-test HTTPS call.</para>
-/// <para><b>Fail-closed:</b> <see cref="TransparentForwardingProxy.Faulted"/>
+/// filters explicitly exclude impostor packets; (b) reflected packets are
+/// marked <c>Inbound</c>, so they no longer match either filter's
+/// <c>outbound</c> clause even before the impostor tag is considered; (c) the
+/// forward filter also excludes any packet addressed to the upstream proxy's
+/// own host:port and any packet SOURCED from the local relay's own listening
+/// port (<see cref="BypassFilterBuilder"/> remarks) - together satisfying
+/// "Residential Connect's own upstream proxy connection must bypass its own
+/// interception path".</para>
+/// <para><b>Fail-closed:</b> <see cref="ITransparentForwardingProxy.Faulted"/>
 /// drives an immediate transition to <see cref="SystemRoutingStatus.FailedClosed"/>;
 /// while in that state (and at every other point where a captured packet does
 /// not match a rule this class explicitly understands how to redirect), the
@@ -102,6 +94,13 @@ namespace ResidentialConnect.Routing;
 /// verified when <see cref="StartAsync"/> is actually called, since WinDivert
 /// auto-installs/uninstalls its driver tied to the handle's own lifetime -
 /// probing for it ahead of time would itself have side effects.</para>
+/// <para><b>Safe shutdown:</b> <see cref="TearDownAsync"/> cancels the capture
+/// loops' cancellation token, then calls <c>WinDivertShutdown(handle,
+/// WINDIVERT_SHUTDOWN_RECV)</c> on every handle to unblock a thread currently
+/// parked inside a blocking <c>WinDivertRecv</c> call, THEN awaits both loop
+/// tasks to actually exit, and ONLY THEN closes the handles. Closing a handle
+/// while a thread is still blocked inside <c>WinDivertRecv</c> for it is not
+/// a safe stop sequence.</para>
 /// <para><b>TCP/UDP support status:</b> V0.2 is <b>TCP-only</b>. Only TCP
 /// flows are redirected through the residential proxy (matching the fact
 /// that both HTTP CONNECT and SOCKS5 upstream tunnels are inherently
@@ -113,13 +112,11 @@ namespace ResidentialConnect.Routing;
 /// limitations" and the acceptance-test notes.</para>
 /// </remarks>
 [SupportedOSPlatform("windows")]
-[SupportedOSPlatform("windows")]
 public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
 {
     private const short ForwardPriority = 0;
     private const short ReturnPriority = 0;
     private const short DnsPriority = 0;
-    private static readonly IntPtr InvalidHandle = new(-1);
 
     private readonly IAppLogger _logger;
     private readonly RedirectFlowTable _flowTable;
@@ -131,9 +128,9 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     private volatile bool _failClosed;
 
     private ITransparentForwardingProxy? _relay;
-    private IntPtr _forwardHandle = InvalidHandle;
-    private IntPtr _returnHandle = InvalidHandle;
-    private IntPtr _dnsHandle = InvalidHandle;
+    private IntPtr _forwardHandle = WinDivertNative.InvalidHandle;
+    private IntPtr _returnHandle = WinDivertNative.InvalidHandle;
+    private IntPtr _dnsHandle = WinDivertNative.InvalidHandle;
     private CancellationTokenSource? _cts;
     private Task? _forwardLoopTask;
     private Task? _returnLoopTask;
@@ -195,6 +192,13 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
 
         try
         {
+            // Validate our native struct layout assumptions BEFORE opening
+            // any WinDivert handle - see WinDivertNative remarks for why
+            // this matters (a mismatched ABI here previously caused
+            // coreclr.dll access-violation crashes via a third-party
+            // managed wrapper).
+            WinDivertNative.ValidateAbi();
+
             var addresses = await Dns.GetHostAddressesAsync(profile.Host, cancellationToken).ConfigureAwait(false);
             var ipv4Addresses = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToList();
             if (ipv4Addresses.Count == 0)
@@ -206,21 +210,20 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             _relay.Faulted += OnRelayFaulted;
             var relayPort = await _relay.StartAsync(profile, password, IPAddress.Any, _flowTable, cancellationToken).ConfigureAwait(false);
 
-            var forwardFilter = BypassFilterBuilder.BuildForwardFilter(ipv4Addresses, profile.Port);
+            var forwardFilter = BypassFilterBuilder.BuildForwardFilter(ipv4Addresses, profile.Port, relayPort);
             var returnFilter = BypassFilterBuilder.BuildReturnFilter(relayPort);
             var dnsFilter = BypassFilterBuilder.BuildDnsFilter();
 
-            _dnsHandle = OpenHandleOrThrow(dnsFilter, WinDivertLayer.Network, DnsPriority, WinDivertOpenFlags.Drop, "DNS leak-protection");
-            _forwardHandle = OpenHandleOrThrow(forwardFilter, WinDivertLayer.Network, ForwardPriority, WinDivertOpenFlags.None, "forward");
-            _returnHandle = OpenHandleOrThrow(returnFilter, WinDivertLayer.Network, ReturnPriority, WinDivertOpenFlags.None, "return");
+            _dnsHandle = OpenHandleOrThrow(dnsFilter, WinDivertNative.Layer.Network, DnsPriority, WinDivertNative.OpenFlags.Drop, "DNS leak-protection");
+            _forwardHandle = OpenHandleOrThrow(forwardFilter, WinDivertNative.Layer.Network, ForwardPriority, WinDivertNative.OpenFlags.None, "forward");
+            _returnHandle = OpenHandleOrThrow(returnFilter, WinDivertNative.Layer.Network, ReturnPriority, WinDivertNative.OpenFlags.None, "return");
 
             _cts = new CancellationTokenSource();
-            var relayAddress = IPAddress.Loopback;
-            _forwardLoopTask = Task.Run(() => ForwardLoop(_forwardHandle, relayAddress, relayPort, _cts.Token), CancellationToken.None);
+            _forwardLoopTask = Task.Run(() => ForwardLoop(_forwardHandle, relayPort, _cts.Token), CancellationToken.None);
             _returnLoopTask = Task.Run(() => ReturnLoop(_returnHandle, _cts.Token), CancellationToken.None);
 
             _stateMarker.MarkActive();
-            _logger.Info("WinDivertSystemTrafficRouter", $"Whole Computer routing active. Forward filter: \"{forwardFilter}\". Relay listening on 127.0.0.1:{relayPort}.");
+            _logger.Info("WinDivertSystemTrafficRouter", $"Whole Computer routing active. Forward filter: \"{forwardFilter}\". Relay listening on 0.0.0.0:{relayPort}.");
             SetStatus(SystemRoutingStatus.Active);
             return SystemRoutingStatus.Active;
         }
@@ -253,12 +256,15 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     {
         _cts?.Cancel();
 
-        // WinDivertClose() on another thread reliably unblocks a thread
-        // currently parked in WinDivertRecv() for that same handle - the
-        // documented, standard way to stop a capture loop.
-        CloseHandle(ref _forwardHandle);
-        CloseHandle(ref _returnHandle);
-        CloseHandle(ref _dnsHandle);
+        // Safe shutdown sequence: WINDIVERT_SHUTDOWN_RECV unblocks a thread
+        // currently parked inside a blocking WinDivertRecv() call for that
+        // handle WITHOUT invalidating the handle itself. Only after both
+        // capture loop tasks have actually observed this and returned do we
+        // close the handles - closing a handle while a thread is still
+        // blocked inside WinDivertRecv for it is not a safe stop sequence.
+        ShutdownReceive(_forwardHandle);
+        ShutdownReceive(_returnHandle);
+        ShutdownReceive(_dnsHandle);
 
         if (_forwardLoopTask is not null)
         {
@@ -269,6 +275,10 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         {
             try { await _returnLoopTask.ConfigureAwait(false); } catch { /* loop already logs its own faults */ }
         }
+
+        CloseHandle(ref _forwardHandle);
+        CloseHandle(ref _returnHandle);
+        CloseHandle(ref _dnsHandle);
 
         if (_relay is not null)
         {
@@ -293,57 +303,74 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         SetStatus(SystemRoutingStatus.FailedClosed);
     }
 
-    private IntPtr OpenHandleOrThrow(string filter, WinDivertLayer layer, short priority, WinDivertOpenFlags flags, string handleDescription)
+    private static IntPtr OpenHandleOrThrow(string filter, WinDivertNative.Layer layer, short priority, WinDivertNative.OpenFlags flags, string handleDescription)
     {
-        var handle = WinDivert.WinDivertOpen(filter, layer, priority, flags);
-        if (handle == InvalidHandle)
+        var handle = WinDivertNative.Open(filter, layer, priority, (ulong)flags);
+        if (handle == WinDivertNative.InvalidHandle || handle == IntPtr.Zero)
         {
             var error = Marshal.GetLastWin32Error();
-            throw new InvalidOperationException($"Failed to open the {handleDescription} WinDivert handle (Win32 error {error}). This usually means the process is not elevated, the WinDivert driver could not be loaded, or another instance already holds a conflicting handle.");
+            throw new InvalidOperationException($"Failed to open the {handleDescription} WinDivert handle (Win32 error {error}). This usually means the process is not elevated, the WinDivert driver could not be loaded, another instance already holds a conflicting handle, or the filter string failed to compile.");
         }
 
         return handle;
     }
 
-    private static void CloseHandle(ref IntPtr handle)
+    private static void ShutdownReceive(IntPtr handle)
     {
-        if (handle != InvalidHandle && handle != IntPtr.Zero)
+        if (handle == WinDivertNative.InvalidHandle || handle == IntPtr.Zero)
         {
-            WinDivert.WinDivertClose(handle);
+            return;
         }
 
-        handle = InvalidHandle;
+        // Best effort - if the handle is already gone this simply fails,
+        // which is fine during teardown.
+        WinDivertNative.ShutdownHandle(handle, WinDivertNative.Shutdown.Recv);
     }
 
-    private void ForwardLoop(IntPtr handle, IPAddress relayAddress, int relayPort, CancellationToken cancellationToken)
+    private static void CloseHandle(ref IntPtr handle)
     {
-        var buffer = new WinDivertBuffer(ushort.MaxValue);
+        if (handle != WinDivertNative.InvalidHandle && handle != IntPtr.Zero)
+        {
+            WinDivertNative.Close(handle);
+        }
+
+        handle = WinDivertNative.InvalidHandle;
+    }
+
+    private unsafe void ForwardLoop(IntPtr handle, int relayPort, CancellationToken cancellationToken)
+    {
+        var buffer = GC.AllocateUninitializedArray<byte>((int)WinDivertNative.MaxPacketSize, pinned: true);
         var processed = 0;
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            fixed (byte* packetBuffer = buffer)
             {
-                var address = new WinDivertAddress();
-                uint recvLen = 0;
-                if (!WinDivert.WinDivertRecv(handle, buffer, ref address, ref recvLen))
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    if (cancellationToken.IsCancellationRequested)
+                    WinDivertNative.Address address = default;
+
+                    if (!WinDivertNative.Recv(handle, packetBuffer, WinDivertNative.MaxPacketSize, out var recvLen, &address))
                     {
-                        break;
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+
+                        continue;
                     }
 
-                    // Transient recv errors (e.g. a packet was too large for
-                    // the buffer) are logged and skipped; a genuinely closed
-                    // handle (our own StopAsync/TearDownAsync) is what the
-                    // cancellation check above is for.
-                    continue;
-                }
+                    if (recvLen == 0 || recvLen > WinDivertNative.MaxPacketSize)
+                    {
+                        continue;
+                    }
 
-                ProcessForwardPacket(handle, buffer, recvLen, ref address, relayAddress, relayPort);
+                    ProcessForwardPacket(handle, packetBuffer, recvLen, &address, relayPort);
 
-                if (++processed % 512 == 0)
-                {
-                    _flowTable.EvictIdle();
+                    if (++processed % 512 == 0)
+                    {
+                        _flowTable.EvictIdle();
+                    }
                 }
             }
         }
@@ -356,32 +383,37 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
                 SetStatus(SystemRoutingStatus.FailedClosed);
             }
         }
-        finally
-        {
-            buffer.Dispose();
-        }
     }
 
-    private void ReturnLoop(IntPtr handle, CancellationToken cancellationToken)
+    private unsafe void ReturnLoop(IntPtr handle, CancellationToken cancellationToken)
     {
-        var buffer = new WinDivertBuffer(ushort.MaxValue);
+        var buffer = GC.AllocateUninitializedArray<byte>((int)WinDivertNative.MaxPacketSize, pinned: true);
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            fixed (byte* packetBuffer = buffer)
             {
-                var address = new WinDivertAddress();
-                uint recvLen = 0;
-                if (!WinDivert.WinDivertRecv(handle, buffer, ref address, ref recvLen))
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    if (cancellationToken.IsCancellationRequested)
+                    WinDivertNative.Address address = default;
+
+                    if (!WinDivertNative.Recv(handle, packetBuffer, WinDivertNative.MaxPacketSize, out var recvLen, &address))
                     {
-                        break;
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+
+                        continue;
                     }
 
-                    continue;
-                }
+                    if (recvLen == 0 || recvLen > WinDivertNative.MaxPacketSize)
+                    {
+                        continue;
+                    }
 
-                ProcessReturnPacket(handle, buffer, recvLen, ref address);
+                    ProcessReturnPacket(handle, packetBuffer, recvLen, &address);
+                }
             }
         }
         catch (Exception ex)
@@ -393,80 +425,167 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
                 SetStatus(SystemRoutingStatus.FailedClosed);
             }
         }
-        finally
-        {
-            buffer.Dispose();
-        }
     }
 
-    private unsafe void ProcessForwardPacket(IntPtr handle, WinDivertBuffer buffer, uint recvLen, ref WinDivertAddress address, IPAddress relayAddress, int relayPort)
+    private unsafe void ProcessForwardPacket(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address, int relayPort)
     {
-        var parsed = WinDivert.WinDivertHelperParsePacket(buffer, recvLen);
-        if (parsed.IPv4Header == null || parsed.TcpHeader == null)
+        if (!TryParseTcpPacket(packetBuffer, recvLen, out var ip, out var tcp))
         {
-            // Not an IPv4/TCP packet (should not happen given our filter -
-            // defensive only). Fail closed: never resend something this
-            // code did not explicitly classify.
+            // Fail closed. Do not resend an unclassified packet.
             return;
         }
 
-        var ip = parsed.IPv4Header;
-        var tcp = parsed.TcpHeader;
+        var captured = CapturePacket(ip, tcp);
 
-        var captured = new CapturedTcpPacket(
-            IsSyn: tcp->Syn != 0,
-            IsAck: tcp->Ack != 0,
-            IsFin: tcp->Fin != 0,
-            IsRst: tcp->Rst != 0,
-            SrcPort: tcp->SrcPort,
-            DstPort: tcp->DstPort,
-            DstAddr: ip->DstAddr);
-
-        var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayAddress, relayPort, _failClosed);
-        if (!decision.ShouldRewrite)
+        var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayPort, _failClosed);
+        if (!decision.ShouldReflect)
         {
-            // Fail-closed: drop rather than resend unmodified.
+            // Fail closed: captured traffic is not resent directly.
             return;
         }
 
-        ip->DstAddr = decision.NewAddress!;
-        tcp->DstPort = (ushort)decision.NewPort!.Value;
-
-        WinDivert.WinDivertHelperCalcChecksums(buffer, recvLen, ref address, WinDivertChecksumHelperParam.All);
-        WinDivert.WinDivertSend(handle, buffer, recvLen, ref address);
+        ApplyReflection(ip, tcp, address, decision);
+        RecalculateAndSend(handle, packetBuffer, recvLen, address, "forward");
     }
 
-    private unsafe void ProcessReturnPacket(IntPtr handle, WinDivertBuffer buffer, uint recvLen, ref WinDivertAddress address)
+    private unsafe void ProcessReturnPacket(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address)
     {
-        var parsed = WinDivert.WinDivertHelperParsePacket(buffer, recvLen);
-        if (parsed.IPv4Header == null || parsed.TcpHeader == null)
+        if (!TryParseTcpPacket(packetBuffer, recvLen, out var ip, out var tcp))
         {
             return;
         }
 
-        var ip = parsed.IPv4Header;
-        var tcp = parsed.TcpHeader;
-
-        var captured = new CapturedTcpPacket(
-            IsSyn: tcp->Syn != 0,
-            IsAck: tcp->Ack != 0,
-            IsFin: tcp->Fin != 0,
-            IsRst: tcp->Rst != 0,
-            SrcPort: tcp->SrcPort,
-            DstPort: tcp->DstPort,
-            DstAddr: ip->DstAddr);
+        var captured = CapturePacket(ip, tcp);
 
         var decision = PacketRedirectPlanner.PlanReturn(captured, _flowTable, _failClosed);
-        if (!decision.ShouldRewrite)
+        if (!decision.ShouldReflect)
         {
             return;
         }
 
-        ip->SrcAddr = decision.NewAddress!;
-        tcp->SrcPort = (ushort)decision.NewPort!.Value;
+        ApplyReflection(ip, tcp, address, decision);
+        RecalculateAndSend(handle, packetBuffer, recvLen, address, "return");
+    }
 
-        WinDivert.WinDivertHelperCalcChecksums(buffer, recvLen, ref address, WinDivertChecksumHelperParam.All);
-        WinDivert.WinDivertSend(handle, buffer, recvLen, ref address);
+    private static unsafe CapturedTcpPacket CapturePacket(WinDivertNative.IPv4Header* ip, WinDivertNative.TcpHeader* tcp)
+    {
+        var tcpFlags = tcp->HeaderLengthAndFlags;
+        return new CapturedTcpPacket(
+            IsSyn: (tcpFlags & 0x0200) != 0,
+            IsAck: (tcpFlags & 0x1000) != 0,
+            IsFin: (tcpFlags & 0x0100) != 0,
+            IsRst: (tcpFlags & 0x0400) != 0,
+            SrcAddr: NativeIpv4ToIPAddress(ip->SrcAddr),
+            SrcPort: NativePortToHost(tcp->SrcPort),
+            DstAddr: NativeIpv4ToIPAddress(ip->DstAddr),
+            DstPort: NativePortToHost(tcp->DstPort));
+    }
+
+    /// <summary>
+    /// Applies a <see cref="RedirectDecision"/> to the real packet headers:
+    /// swap source/destination address and port, and flip the packet's
+    /// direction from Outbound to Inbound (<see cref="WinDivertNative.MarkInbound"/>)
+    /// - the "reflection" that makes Windows' own TCP/IP stack treat this as
+    /// a packet that genuinely arrived from the network. See
+    /// <see cref="RedirectDecision"/>'s remarks for the full rationale.
+    /// </summary>
+    private static unsafe void ApplyReflection(WinDivertNative.IPv4Header* ip, WinDivertNative.TcpHeader* tcp, WinDivertNative.Address* address, RedirectDecision decision)
+    {
+        ip->SrcAddr = IPAddressToNativeIpv4(decision.NewSrcAddr!);
+        ip->DstAddr = IPAddressToNativeIpv4(decision.NewDstAddr!);
+        tcp->SrcPort = HostPortToNative(decision.NewSrcPort!.Value);
+        tcp->DstPort = HostPortToNative(decision.NewDstPort!.Value);
+
+        WinDivertNative.MarkInbound(address);
+    }
+
+    private unsafe void RecalculateAndSend(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address, string legName)
+    {
+        // flags == 0 means recalculate all applicable checksums.
+        if (!WinDivertNative.CalcChecksums(packetBuffer, recvLen, address, 0))
+        {
+            _failClosed = true;
+            _logger.Error("WinDivertSystemTrafficRouter", $"WinDivert checksum recalculation failed on the {legName} leg; failing closed.", new InvalidOperationException($"Win32 error {Marshal.GetLastWin32Error()}."));
+            SetStatus(SystemRoutingStatus.FailedClosed);
+            return;
+        }
+
+        if (!WinDivertNative.Send(handle, packetBuffer, recvLen, out _, address))
+        {
+            _failClosed = true;
+            _logger.Error("WinDivertSystemTrafficRouter", $"WinDivert packet reinjection failed on the {legName} leg; failing closed.", new InvalidOperationException($"Win32 error {Marshal.GetLastWin32Error()}."));
+            SetStatus(SystemRoutingStatus.FailedClosed);
+        }
+    }
+
+    private static unsafe bool TryParseTcpPacket(byte* packetBuffer, uint packetLength, out WinDivertNative.IPv4Header* ipv4Header, out WinDivertNative.TcpHeader* tcpHeader)
+    {
+        ipv4Header = null;
+        tcpHeader = null;
+
+        var result = WinDivertNative.ParsePacket(
+            packetBuffer,
+            packetLength,
+            out var ip,
+            out _,
+            out var protocol,
+            out _,
+            out _,
+            out var tcp,
+            out _,
+            out _,
+            out _,
+            out _,
+            out _);
+
+        if (!result || ip == null || tcp == null)
+        {
+            return false;
+        }
+
+        // IPv4 TCP only - V0.2 is TCP-only and does not handle IPv6.
+        if (ip->Version != 4 || protocol != 6)
+        {
+            return false;
+        }
+
+        ipv4Header = ip;
+        tcpHeader = tcp;
+        return true;
+    }
+
+    /// <summary>TCP ports in the packet are stored in network (big-endian) byte order.</summary>
+    private static int NativePortToHost(ushort nativePort) => BinaryPrimitives.ReverseEndianness(nativePort);
+
+    private static ushort HostPortToNative(int hostPort)
+    {
+        if (hostPort is < 1 or > 65535)
+        {
+            throw new ArgumentOutOfRangeException(nameof(hostPort), hostPort, "TCP port must be between 1 and 65535.");
+        }
+
+        return BinaryPrimitives.ReverseEndianness((ushort)hostPort);
+    }
+
+    private static IPAddress NativeIpv4ToIPAddress(uint nativeAddress)
+    {
+        // WINDIVERT_IPHDR addresses are the four IPv4 bytes as they appear
+        // in the packet. Windows is little-endian, so BitConverter restores
+        // those four bytes in network-address order for IPAddress.
+        return new IPAddress(BitConverter.GetBytes(nativeAddress));
+    }
+
+    private static uint IPAddressToNativeIpv4(IPAddress address)
+    {
+        ArgumentNullException.ThrowIfNull(address);
+
+        var bytes = address.GetAddressBytes();
+        if (bytes.Length != 4)
+        {
+            throw new ArgumentException("Whole Computer V0.2 currently supports IPv4 addresses only.", nameof(address));
+        }
+
+        return BitConverter.ToUInt32(bytes, 0);
     }
 
     private static bool IsCurrentProcessElevated()
