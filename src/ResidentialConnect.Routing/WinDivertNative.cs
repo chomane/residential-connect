@@ -70,6 +70,21 @@ internal static unsafe class WinDivertNative
     }
 
     /// <summary>
+    /// WINDIVERT_PARAM identifiers for <see cref="SetParam"/>. Only the two
+    /// used by this router are declared. See remarks on
+    /// <see cref="SetParam"/> for why <c>QueueLength</c>/<c>QueueTime</c> are
+    /// tuned up from their defaults.
+    /// </summary>
+    internal enum Param : int
+    {
+        QueueLength = 0,
+        QueueTime = 1,
+        QueueSize = 2,
+        VersionMajor = 3,
+        VersionMinor = 4
+    }
+
+    /// <summary>
     /// Exact 80-byte WINDIVERT_ADDRESS layout used by WinDivert 2.2.2.
     ///
     /// Offset  0: INT64 Timestamp
@@ -246,6 +261,24 @@ internal static unsafe class WinDivertNative
         SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool Close(IntPtr handle);
+
+    /// <summary>
+    /// Sets a per-handle WinDivert queue parameter
+    /// (<c>WinDivertSetParam</c>). Used to raise <see cref="Param.QueueLength"/>
+    /// and <see cref="Param.QueueTime"/> above their (fairly small) defaults
+    /// - see <c>WinDivertSystemTrafficRouter</c>'s remarks on why the
+    /// capture loops must be serviced by dedicated OS threads AND why the
+    /// driver-side queue itself is given extra headroom as a second,
+    /// independent safety margin against the same "packet captured but not
+    /// read in time gets silently dropped" failure mode.
+    /// </summary>
+    [DllImport(
+        "WinDivert.dll",
+        EntryPoint = "WinDivertSetParam",
+        CallingConvention = CallingConvention.Cdecl,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetParam(IntPtr handle, Param param, ulong value);
 
     [DllImport(
         "WinDivert.dll",

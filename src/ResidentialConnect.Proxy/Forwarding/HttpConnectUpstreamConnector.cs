@@ -63,7 +63,7 @@ public sealed class HttpConnectUpstreamConnector : IUpstreamConnector
             // through SecretScrubber as defense in depth.
             if (DiagnosticsEnabled)
             {
-                _logger?.Debug("RoutingDiagnostics", $"Upstream CONNECT {targetHost}:{targetPort} via {_proxyHost}:{_proxyPort} -> status line: \"{statusLine}\"");
+                _logger?.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] Upstream CONNECT {targetHost}:{targetPort} via {_proxyHost}:{_proxyPort} -> status line: \"{statusLine}\"");
             }
 
             if (!statusLine.Contains(" 200"))

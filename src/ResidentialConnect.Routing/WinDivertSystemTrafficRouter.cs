@@ -101,6 +101,30 @@ namespace ResidentialConnect.Routing;
 /// tasks to actually exit, and ONLY THEN closes the handles. Closing a handle
 /// while a thread is still blocked inside <c>WinDivertRecv</c> for it is not
 /// a safe stop sequence.</para>
+/// <para><b>Capture-loop scheduling (2026-09-15 fix):</b> the forward and
+/// return capture loops each run on their own dedicated, always-on
+/// background <see cref="Thread"/> (<see cref="StartDedicatedThread"/>) -
+/// NOT via <c>Task.Run</c>/the shared .NET ThreadPool. A first instrumented
+/// Windows run (per-packet tuple/timestamp logging added for exactly this
+/// purpose - see the <c>RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS</c> fields
+/// below) showed the return leg's SYN-ACK for a brand-new flow arriving
+/// several SECONDS after the corresponding forward SYN (during which the
+/// forward loop kept servicing unrelated flows fine), with several queued
+/// return captures then appearing together in a burst - the textbook
+/// signature of one of the two loops not getting a ThreadPool worker
+/// thread promptly under load, while WinDivert's own driver-side capture
+/// queue (bounded by <c>WINDIVERT_PARAM_QUEUE_TIME</c>, 2000ms by default)
+/// silently drops whatever it could not deliver to user mode in time. Each
+/// loop is a tight, always-blocked-in-native-code <c>while</c> loop for the
+/// life of the routing session - exactly the "long-running, always busy"
+/// workload the ThreadPool is documented to be a poor fit for (new threads
+/// are only added slowly, well after the pool's initial worker count is
+/// exhausted). Dedicated threads guarantee both loops are serviced
+/// immediately, independent of what else the process's ThreadPool is doing
+/// (including the very HttpClient/SslStream work being routed).
+/// <see cref="TrySetQueueHeadroom"/> additionally raises the driver-side
+/// queue length/time above their defaults as a second, independent safety
+/// margin against the same underlying failure mode.</para>
 /// <para><b>TCP/UDP support status:</b> V0.2 is <b>TCP-only</b>. Only TCP
 /// flows are redirected through the residential proxy (matching the fact
 /// that both HTTP CONNECT and SOCKS5 upstream tunnels are inherently
@@ -241,9 +265,47 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             _forwardHandle = OpenHandleOrThrow(forwardFilter, WinDivertNative.Layer.Network, ForwardPriority, WinDivertNative.OpenFlags.None, "forward");
             _returnHandle = OpenHandleOrThrow(returnFilter, WinDivertNative.Layer.Network, ReturnPriority, WinDivertNative.OpenFlags.None, "return");
 
+            // Give the driver-side per-handle capture queue extra headroom
+            // as a second, independent safety margin on top of the dedicated
+            // capture threads started below (see remarks on why both matter
+            // - "2026-09-15 return-leg starvation" root cause). Defaults are
+            // QUEUE_LENGTH=4096 packets / QUEUE_TIME=2000ms; a 3x bump costs
+            // only a little extra kernel-pool memory and directly targets
+            // the observed "reflected SYN-ACKs arrive several seconds late,
+            // in a burst" symptom. Best-effort: if an older WinDivert build
+            // rejects one of these params, capture still works with the
+            // built-in defaults, just with less headroom - never fail the
+            // whole start over this.
+            TrySetQueueHeadroom(_forwardHandle, "forward");
+            TrySetQueueHeadroom(_returnHandle, "return");
+
             _cts = new CancellationTokenSource();
-            _forwardLoopTask = Task.Run(() => ForwardLoop(_forwardHandle, relayPort, _cts.Token), CancellationToken.None);
-            _returnLoopTask = Task.Run(() => ReturnLoop(_returnHandle, _cts.Token), CancellationToken.None);
+
+            // --- Dedicated OS threads, NOT Task.Run/ThreadPool -----------
+            // Root cause of the 2026-09-15 "SYN-ACK arrives ~7s late, right
+            // before the HttpClient gives up" symptom: both capture loops
+            // are tight `while` loops blocked almost the entire time inside
+            // a native WinDivertRecv() call - i.e. long-running, blocking
+            // work, which is exactly what the shared .NET ThreadPool is
+            // documented to handle badly (it grows slowly, ~1 thread/sec
+            // under sustained starvation, and only after the global
+            // starvation detector kicks in). Scheduling both loops via
+            // Task.Run meant they competed for ThreadPool worker threads
+            // with everything else (including this very process's own
+            // HttpClient/SslStream continuations) - if the return loop's
+            // Task didn't get a thread promptly, WinDivert kept queuing
+            // (and eventually dropping, per QUEUE_TIME) SYN-ACKs behind the
+            // scenes while nothing serviced WinDivertRecv on the return
+            // handle, exactly matching the observed diagnostic log (a long
+            // silent gap on the return leg, then a burst of several
+            // RETURN captures appearing together once a thread finally
+            // became free). WinDivert's own documentation is explicit that
+            // a handle must be serviced "as soon as possible" or captured
+            // packets are dropped. Dedicated, always-on background threads
+            // guarantee both loops always have a thread immediately
+            // available, independent of ThreadPool/application load.
+            _forwardLoopTask = StartDedicatedThread(() => ForwardLoop(_forwardHandle, relayPort, _cts.Token), "RC-WinDivert-Forward");
+            _returnLoopTask = StartDedicatedThread(() => ReturnLoop(_returnHandle, _cts.Token), "RC-WinDivert-Return");
 
             _stateMarker.MarkActive();
             _logger.Info("WinDivertSystemTrafficRouter", $"Whole Computer routing active. Forward filter: \"{forwardFilter}\". Relay listening on 0.0.0.0:{relayPort}.");
@@ -338,6 +400,64 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         }
 
         return handle;
+    }
+
+    /// <summary>
+    /// Starts <paramref name="loopBody"/> on a dedicated, non-ThreadPool
+    /// background <see cref="Thread"/> and returns a <see cref="Task"/> that
+    /// completes when the thread exits - so existing await/teardown call
+    /// sites (<see cref="TearDownAsync"/>) need no changes. See the long
+    /// comment at the <c>Task.Run</c> call sites this replaces (in
+    /// <see cref="StartAsync"/>) for the full root-cause rationale.
+    /// </summary>
+    private static Task StartDedicatedThread(Action loopBody, string threadName)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                loopBody();
+                tcs.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = threadName,
+            Priority = ThreadPriority.AboveNormal
+        };
+        thread.Start();
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// Best-effort: raises this handle's driver-side capture queue length
+    /// and queue time above WinDivert's defaults (4096 packets / 2000ms) as
+    /// a second, independent safety margin against the same
+    /// captured-but-not-serviced-in-time packet loss the dedicated capture
+    /// threads (see <see cref="StartDedicatedThread"/>) primarily address.
+    /// Never throws and never fails the overall start - an older WinDivert
+    /// build rejecting one of these params just means less headroom, not a
+    /// reason to refuse to route at all.
+    /// </summary>
+    private void TrySetQueueHeadroom(IntPtr handle, string handleDescription)
+    {
+        const ulong queueLength = 8192; // default 4096
+        const ulong queueTimeMs = 4096; // default 2000ms (min 128, max 16000)
+
+        if (!WinDivertNative.SetParam(handle, WinDivertNative.Param.QueueLength, queueLength))
+        {
+            _logger.Debug("RoutingDiagnostics", $"Could not raise QueueLength on the {handleDescription} handle (Win32 error {Marshal.GetLastWin32Error()}); continuing with the driver default.");
+        }
+
+        if (!WinDivertNative.SetParam(handle, WinDivertNative.Param.QueueTime, queueTimeMs))
+        {
+            _logger.Debug("RoutingDiagnostics", $"Could not raise QueueTime on the {handleDescription} handle (Win32 error {Marshal.GetLastWin32Error()}); continuing with the driver default.");
+        }
     }
 
     private static void ShutdownReceive(IntPtr handle)
@@ -470,7 +590,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionBefore = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
         }
 
         var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayPort, _failClosed);
@@ -479,7 +599,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             // Fail closed: captured traffic is not resent directly.
             if (_diagnosticsEnabled)
             {
-                _logger.Debug("RoutingDiagnostics", $"[FORWARD #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
+                _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
             }
 
             return;
@@ -490,7 +610,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionAfter = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[FORWARD #{captureNumber}] reflected -> {decision.NewSrcAddr}:{decision.NewSrcPort} -> {decision.NewDstAddr}:{decision.NewDstPort} direction-after={directionAfter}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] reflected -> {decision.NewSrcAddr}:{decision.NewSrcPort} -> {decision.NewDstAddr}:{decision.NewDstPort} direction-after={directionAfter}");
         }
 
         RecalculateAndSend(handle, packetBuffer, recvLen, address, "forward", captured, captureNumber);
@@ -509,7 +629,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionBefore = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore}");
         }
 
         var decision = PacketRedirectPlanner.PlanReturn(captured, _flowTable, _failClosed);
@@ -517,7 +637,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         {
             if (_diagnosticsEnabled)
             {
-                _logger.Debug("RoutingDiagnostics", $"[RETURN #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
+                _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
             }
 
             return;
@@ -528,7 +648,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionAfter = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[RETURN #{captureNumber}] reflected -> {decision.NewSrcAddr}:{decision.NewSrcPort} -> {decision.NewDstAddr}:{decision.NewDstPort} direction-after={directionAfter}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] reflected -> {decision.NewSrcAddr}:{decision.NewSrcPort} -> {decision.NewDstAddr}:{decision.NewDstPort} direction-after={directionAfter}");
         }
 
         RecalculateAndSend(handle, packetBuffer, recvLen, address, "return", captured, captureNumber);
@@ -603,7 +723,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         Interlocked.Increment(ref _successfulReinjectionCount);
         if (_diagnosticsEnabled)
         {
-            _logger.Debug("RoutingDiagnostics", $"[{legName.ToUpperInvariant()} #{captureNumber}] reinjected successfully.");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [{legName.ToUpperInvariant()} #{captureNumber}] reinjected successfully.");
         }
     }
 

@@ -126,7 +126,7 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
 
             if (DiagnosticsEnabled)
             {
-                _logger.Debug("RoutingDiagnostics", $"TransparentForwardingProxy accepted a redirected TCP connection from apparent peer {clientEndpoint}.");
+                _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] TransparentForwardingProxy accepted a redirected TCP connection from apparent peer {clientEndpoint}.");
             }
 
             if (clientEndpoint is null || !_destinationResolver!.TryResolve(clientEndpoint, out var targetHost, out var targetPort))
@@ -139,7 +139,7 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
 
             if (DiagnosticsEnabled)
             {
-                _logger.Debug("RoutingDiagnostics", $"Resolved original destination for {clientEndpoint} -> {targetHost}:{targetPort}. Opening upstream tunnel.");
+                _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] Resolved original destination for {clientEndpoint} -> {targetHost}:{targetPort}. Opening upstream tunnel.");
             }
 
             var localStream = localClient.GetStream();
@@ -157,7 +157,7 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
                     // Socks5UpstreamConnector - a non-200/non-success reply
                     // throws before returning). No credentials are logged
                     // here - only host:port and the fact that it succeeded.
-                    _logger.Debug("RoutingDiagnostics", $"Upstream tunnel to {targetHost}:{targetPort} established (CONNECT/handshake succeeded).");
+                    _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] Upstream tunnel to {targetHost}:{targetPort} established (CONNECT/handshake succeeded).");
                 }
             }
             catch (Exception ex) when (ex is IOException or SocketException or ProxyAuthenticationException)
