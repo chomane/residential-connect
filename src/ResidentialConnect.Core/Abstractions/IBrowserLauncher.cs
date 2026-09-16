@@ -22,6 +22,12 @@ public interface IBrowserLauncher
     bool IsAvailable { get; }
 
     /// <summary>
+    /// Terminates managed browser trees and stops their relays. Cancellation
+    /// only applies before cleanup starts; owned sessions are always cleaned up.
+    /// </summary>
+    Task DisconnectAllAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Launches the browser configured to use <paramref name="profile"/> for
     /// all traffic, with proxy authentication handled automatically (no
     /// credential prompt), and optionally navigates to <paramref name="startUrl"/>.

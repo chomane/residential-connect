@@ -1,6 +1,7 @@
 using System.Windows;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Common;
+using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
 
 namespace ResidentialConnect.Client;
@@ -133,6 +134,23 @@ public partial class MainWindow : Window
     {
         if (_connectionManager.CurrentState.Status == ConnectionStatus.Connected)
         {
+            if (_connectionManager.CurrentState.Mode == ConnectionMode.BrowserOnly)
+            {
+                ConnectButton.IsEnabled = false;
+                OpenBrowserButton.IsEnabled = false;
+                StatusText.Text = "Status: Disconnecting browser sessions...";
+                try
+                {
+                    await _browserLauncher.DisconnectAllAsync();
+                }
+                catch (Exception ex)
+                {
+                    App.Services.Logger.Error("BrowserLauncher", "Browser disconnect failed.", ex);
+                    MessageBox.Show(this, "Browser cleanup failed. See diagnostics log for details.", "Disconnect Failed");
+                    RenderState(_connectionManager.CurrentState);
+                    return;
+                }
+            }
             await _connectionManager.DisconnectAsync();
             return;
         }

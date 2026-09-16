@@ -26,6 +26,24 @@ public partial class App : Application
 {
     public static AppServices Services { get; private set; } = null!;
 
+    protected override void OnExit(ExitEventArgs e)
+    {
+        try
+        {
+            // All cleanup awaits are context-free, so normal WPF shutdown can
+            // wait for owned browsers and relays before terminating the app.
+            Services?.BrowserLauncher.DisconnectAllAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Services?.Logger.Error("BrowserLauncher", "Best-effort browser cleanup on exit failed.", ex);
+        }
+        finally
+        {
+            base.OnExit(e);
+        }
+    }
+
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);

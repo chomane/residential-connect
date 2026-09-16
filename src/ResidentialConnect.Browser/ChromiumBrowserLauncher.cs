@@ -19,35 +19,9 @@ namespace ResidentialConnect.Browser;
 /// username/password handshake), no proxy credential prompt is ever shown.
 /// </summary>
 /// <remarks>
-/// <b>Relay lifetime bugfix (V0.1, found during Whole Computer mode
-/// hardening on 2026-09-15):</b> the original implementation stopped and
-/// disposed the relay via
-/// <c>process.WaitForExitAsync().ContinueWith(...)</c> on the
-/// <see cref="Process"/> object returned by <see cref="Process.Start"/>.
-/// That is unsafe with Chromium-based browsers: when an already-running
-/// browser instance exists, or when the launched executable is itself a
-/// short-lived stub/launcher, Chromium can hand off the actual browser
-/// window to a *different*, longer-lived OS process while the
-/// <see cref="Process"/> handle captured here exits almost immediately.
-/// The previous code would then stop and dispose the loopback relay while
-/// the real browser window was still open and actively using it, which
-/// surfaces to the user as the browser suddenly failing every request with
-/// <c>ERR_PROXY_CONNECTION_FAILED</c> shortly after launch.
-/// <para>
-/// The fix is to stop tying relay lifetime to that specific
-/// <see cref="Process"/> object at all. Instead, every relay that is
-/// successfully started and confirmed running is kept alive (strongly
-/// referenced in <see cref="_activeRelays"/>) for the remaining lifetime of
-/// the Residential Connect application process itself. The operating
-/// system releases the underlying loopback TCP listener automatically when
-/// this application process exits, so there is no listener/port leak across
-/// application restarts - only within a single run, where the relay
-/// deliberately outlives the short-lived launcher <see cref="Process"/>
-/// object. This trades a theoretical "one relay per browser launch forever
-/// running" cost (acceptable for a desktop utility with a small number of
-/// launches per session) for correctness: the browser is never left pointed
-/// at a relay that Residential Connect has already torn down.
-/// </para>
+/// Keep each browser and relay until explicit disconnect, even if Chromium's
+/// launcher exits early or hands off to another managed instance. Never stop
+/// a relay merely because its original process exited.
 /// </remarks>
 [SupportedOSPlatform("windows")]
 public sealed class ChromiumBrowserLauncher : IBrowserLauncher
@@ -57,23 +31,35 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
     private readonly Func<ILocalForwardingProxy> _forwardingProxyFactory;
     private readonly IAppLogger _logger;
 
-    // Keep relays alive for the lifetime of the Residential Connect process
-    // rather than tying them to the (possibly short-lived) launcher
-    // Process object - see the class-level <remarks> above for the full
-    // root-cause analysis of why this is required.
-    private readonly List<ILocalForwardingProxy> _activeRelays = new();
-    private readonly object _relayLock = new();
+    private sealed record Session(Process? Browser, ILocalForwardingProxy Relay);
+    private readonly List<Session> _sessions = new();
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private readonly Func<ProcessStartInfo, Process?> _startProcess;
+    private readonly string _profilesDirectory;
 
     public ChromiumBrowserLauncher(
         IBrowserProvider browserProvider,
         ICredentialStore credentialStore,
         Func<ILocalForwardingProxy> forwardingProxyFactory,
         IAppLogger logger)
+        : this(browserProvider, credentialStore, forwardingProxyFactory, logger, Process.Start)
+    {
+    }
+
+    internal ChromiumBrowserLauncher(
+        IBrowserProvider browserProvider,
+        ICredentialStore credentialStore,
+        Func<ILocalForwardingProxy> forwardingProxyFactory,
+        IAppLogger logger,
+        Func<ProcessStartInfo, Process?> startProcess,
+        string? profilesDirectory = null)
     {
         _browserProvider = browserProvider ?? throw new ArgumentNullException(nameof(browserProvider));
         _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
         _forwardingProxyFactory = forwardingProxyFactory ?? throw new ArgumentNullException(nameof(forwardingProxyFactory));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _startProcess = startProcess ?? throw new ArgumentNullException(nameof(startProcess));
+        _profilesDirectory = profilesDirectory ?? AppPaths.BrowserProfilesDirectory;
     }
 
     public bool IsAvailable => _browserProvider.FindExecutable() is not null;
@@ -95,7 +81,9 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
             return BrowserLaunchResult.Failed("No stored password found for this proxy. Please edit the proxy and re-enter the password.");
         }
 
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         ILocalForwardingProxy? relay = null;
+        Process? process = null;
 
         try
         {
@@ -113,8 +101,7 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
             // here is the safer, explicit behavior.
             if (!relay.IsRunning || relay.Port != localPort)
             {
-                await relay.StopAsync().ConfigureAwait(false);
-                relay.Dispose();
+                await CleanupAsync(new Session(null, relay)).ConfigureAwait(false);
                 relay = null;
                 _logger.Error("BrowserLauncher", "Local relay failed to start correctly; refusing to launch the browser to avoid an unproxied session.");
                 return BrowserLaunchResult.Failed("Failed to start the local proxy relay. The browser was not launched, to avoid it using your normal internet connection unproxied.");
@@ -125,7 +112,7 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
             // the user's real Chrome/Edge profile directory - guarantees this
             // launch cannot collide with, or hand off to, the user's normal
             // browser session.
-            var profileDir = Path.Combine(AppPaths.BrowserProfilesDirectory, profile.Id.ToString("N"));
+            var profileDir = Path.Combine(_profilesDirectory, profile.Id.ToString("N"));
             Directory.CreateDirectory(profileDir);
 
             // IMPORTANT: ChromiumArgumentsBuilder.Build() returns RAW argument
@@ -149,58 +136,91 @@ public sealed class ChromiumBrowserLauncher : IBrowserLauncher
                 startInfo.ArgumentList.Add(arg);
             }
 
-            var process = Process.Start(startInfo);
+            cancellationToken.ThrowIfCancellationRequested();
+            process = _startProcess(startInfo);
             if (process is null)
             {
-                await relay.StopAsync().ConfigureAwait(false);
-                relay.Dispose();
+                await CleanupAsync(new Session(null, relay)).ConfigureAwait(false);
                 relay = null;
                 return BrowserLaunchResult.Failed("Failed to start the browser process.");
             }
 
-            // The browser has successfully started. Keep its relay strongly
-            // referenced for the remaining lifetime of this Residential
-            // Connect process instead of stopping it when this particular
-            // Process object exits.
-            //
-            // We intentionally do NOT use
-            // process.WaitForExitAsync().ContinueWith(...) to stop the relay
-            // here. Chromium can start (or hand off to) a different,
-            // longer-lived OS process while this launcher's Process object
-            // exits almost immediately - stopping the relay on that exit
-            // would kill the browser's proxy connection out from under a
-            // still-open browser window (ERR_PROXY_CONNECTION_FAILED). The
-            // OS reclaims the loopback listener when Residential Connect
-            // itself exits, so no port is leaked across app restarts.
-            lock (_relayLock)
-            {
-                _activeRelays.Add(relay);
-            }
-
             _logger.Info("BrowserLauncher", $"Launched browser (pid={process.Id}) via persistent local relay on port {localPort} for proxy '{profile.Name}'.");
 
-            return BrowserLaunchResult.Successful(process.Id);
+            var result = BrowserLaunchResult.Successful(process.Id);
+            _sessions.Add(new Session(process, relay));
+            return result;
         }
         catch (Exception ex)
         {
             if (relay is not null)
             {
-                try
+                try { await CleanupAsync(new Session(process, relay)).ConfigureAwait(false); }
+                catch (Exception cleanupError)
                 {
-                    await relay.StopAsync().ConfigureAwait(false);
+                    _logger.Error("BrowserLauncher", "Failed to clean up an unsuccessful browser launch.", cleanupError);
                 }
-                catch
-                {
-                    // Preserve the original launch exception as the reported
-                    // failure; a failure while tearing down an already-failed
-                    // relay is not the interesting error here.
-                }
-
-                relay.Dispose();
             }
 
             _logger.Error("BrowserLauncher", "Failed to launch browser through proxy.", ex);
             return BrowserLaunchResult.Failed("Failed to launch the browser. See diagnostics log for details.");
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+    }
+
+    public async Task DisconnectAllAsync(CancellationToken cancellationToken = default)
+    {
+        // Cancellation may abort waiting for ownership, but must never abandon
+        // the snapshot after it has been removed from the managed collection.
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var sessions = _sessions.ToArray();
+            _sessions.Clear();
+            List<Exception> errors = new();
+            foreach (var session in sessions)
+            {
+                try { await CleanupAsync(session).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                    _logger.Error("BrowserLauncher", "Failed to clean up a managed browser session.", ex);
+                }
+            }
+            if (errors.Count > 0)
+                throw new AggregateException("Managed browser cleanup failed.", errors);
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+    }
+
+    private static async Task CleanupAsync(Session session)
+    {
+        try
+        {
+            if (session.Browser is { } process)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        try { process.Kill(entireProcessTree: true); }
+                        catch (Exception ex) when ((ex is InvalidOperationException or System.ComponentModel.Win32Exception) && process.HasExited) { }
+                    }
+                    await process.WaitForExitAsync().ConfigureAwait(false);
+                }
+                finally { process.Dispose(); }
+            }
+        }
+        finally
+        {
+            try { await session.Relay.StopAsync().ConfigureAwait(false); }
+            finally { session.Relay.Dispose(); }
         }
     }
 }
