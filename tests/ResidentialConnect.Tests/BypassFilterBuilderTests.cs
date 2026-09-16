@@ -175,4 +175,39 @@ public class BypassFilterBuilderTests
         Assert.Contains("!loopback", filter);
         Assert.Contains("!impostor", filter);
     }
+
+    [Fact]
+    public void BuildDnsFilter_IsUnchangedByTheUdpBlockAddition()
+    {
+        // Standing instruction: the 2026-09-16 general UDP-block handle must
+        // be strictly additive and must never alter the already-verified
+        // DNS-block filter string.
+        var filter = BypassFilterBuilder.BuildDnsFilter();
+
+        Assert.Equal("outbound and !loopback and !impostor and udp and udp.DstPort == 53", filter);
+    }
+
+    [Fact]
+    public void BuildUdpBlockFilter_MatchesOutboundNonLoopbackUdp_ButExcludesPort53()
+    {
+        // Port 53 is deliberately excluded here so this handle's Drop rule
+        // never overlaps the same packet as BuildDnsFilter's own, separate,
+        // unchanged Drop handle (see BuildUdpBlockFilter remarks).
+        var filter = BypassFilterBuilder.BuildUdpBlockFilter();
+
+        Assert.Contains("outbound", filter);
+        Assert.Contains("!loopback", filter);
+        Assert.Contains("udp", filter);
+        Assert.Contains("udp.DstPort != 53", filter);
+    }
+
+    [Fact]
+    public void BuildUdpBlockFilter_DoesNotReferenceTcpAtAll()
+    {
+        // Fail-safe sanity check that this UDP-only filter cannot possibly
+        // match/interfere with the verified TCP forward/return handles.
+        var filter = BypassFilterBuilder.BuildUdpBlockFilter();
+
+        Assert.DoesNotContain("tcp", filter);
+    }
 }

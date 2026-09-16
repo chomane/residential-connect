@@ -30,13 +30,24 @@ namespace ResidentialConnect.Routing;
 /// <remarks>
 /// <para><b>How interception/redirection actually works (the "reflection" pattern):</b></para>
 /// <list type="number">
-/// <item>Three WinDivert handles are opened at <see cref="WinDivertNative.Layer.Network"/>
+/// <item>Four WinDivert handles are opened at <see cref="WinDivertNative.Layer.Network"/>
 /// (the only layer that can both capture AND re-inject modified packets):
 ///   <list type="bullet">
 ///   <item>A <b>DNS-block handle</b> (see <see cref="DnsLeakGuard"/>) opened
 ///   with <see cref="WinDivertNative.OpenFlags.Drop"/> - the driver itself
 ///   silently drops matching packets in-kernel; nothing is ever delivered to
 ///   user mode. This alone is V0.2's entire DNS leak protection.</item>
+///   <item>A <b>UDP-block handle</b> (2026-09-16 addition; see
+///   <see cref="BypassFilterBuilder.BuildUdpBlockFilter"/>), ALSO opened
+///   with <see cref="WinDivertNative.OpenFlags.Drop"/> and ALSO entirely
+///   in-kernel/fail-closed. Blocks every other real, non-loopback outbound
+///   UDP packet (i.e. everything except UDP/53, which the DNS-block handle
+///   above already owns) because the current Residential Connect upstream
+///   implementation does not proxy UDP: HTTP CONNECT is TCP-only, and our
+///   current SOCKS5 connector implements TCP CONNECT only (SOCKS5 UDP
+///   ASSOCIATE is not implemented) - see that method's remarks for the full
+///   rationale. This is purely additive: it does not touch the DNS-block
+///   handle or either TCP handle below.</item>
 ///   <item>A <b>forward handle</b> capturing real, non-loopback outbound TCP
 ///   traffic (<see cref="BypassFilterBuilder.BuildForwardFilter"/>), excluding
 ///   traffic to the upstream proxy itself and the local relay's own reply
@@ -143,14 +154,21 @@ namespace ResidentialConnect.Routing;
 /// queue length/time above their defaults as a second, independent safety
 /// margin against the same underlying failure mode.</para>
 /// <para><b>TCP/UDP support status:</b> V0.2 is <b>TCP-only</b>. Only TCP
-/// flows are redirected through the residential proxy (matching the fact
-/// that both HTTP CONNECT and SOCKS5 upstream tunnels are inherently
-/// TCP-based - see <c>HttpConnectUpstreamConnector</c>/<c>Socks5UpstreamConnector</c>).
-/// Plain UDP is NOT redirected or proxied for arbitrary applications; the
-/// only UDP-specific handling at all is the DNS-leak block described above
-/// (which blocks, rather than proxies, UDP/53). This is a real, documented
-/// limitation, not a hidden gap - see <c>docs/ARCHITECTURE.md</c> "Known
-/// limitations" and the acceptance-test notes.</para>
+/// flows are redirected through the residential proxy. This matches the
+/// current upstream connector implementations, not a protocol-level
+/// impossibility: HTTP CONNECT is TCP-only by definition, and our current
+/// SOCKS5 connector (<c>Socks5UpstreamConnector</c>) implements TCP CONNECT
+/// only - SOCKS5 UDP ASSOCIATE is not implemented - so there is presently no
+/// upstream path capable of carrying UDP through the residential proxy
+/// (see <c>HttpConnectUpstreamConnector</c>/<c>Socks5UpstreamConnector</c>).
+/// Plain UDP is therefore NOT redirected or proxied for arbitrary
+/// applications; as of 2026-09-16 it is instead uniformly BLOCKED
+/// (fail-closed) rather than left to leak direct - the DNS-block handle
+/// above owns UDP/53 specifically, and the UDP-block handle above owns
+/// every other UDP packet (see <see cref="BypassFilterBuilder.BuildUdpBlockFilter"/>).
+/// This is a real, documented limitation, not a hidden gap - see
+/// <c>docs/ARCHITECTURE.md</c> "Known limitations" and the acceptance-test
+/// notes.</para>
 /// </remarks>
 [SupportedOSPlatform("windows")]
 public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
@@ -158,6 +176,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     private const short ForwardPriority = 0;
     private const short ReturnPriority = 0;
     private const short DnsPriority = 0;
+    private const short UdpBlockPriority = 0;
 
     private readonly IAppLogger _logger;
     private readonly RedirectFlowTable _flowTable;
@@ -172,6 +191,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     private IntPtr _forwardHandle = WinDivertNative.InvalidHandle;
     private IntPtr _returnHandle = WinDivertNative.InvalidHandle;
     private IntPtr _dnsHandle = WinDivertNative.InvalidHandle;
+    private IntPtr _udpBlockHandle = WinDivertNative.InvalidHandle;
     private CancellationTokenSource? _cts;
     private Task? _forwardLoopTask;
     private Task? _returnLoopTask;
@@ -277,8 +297,19 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             var forwardFilter = BypassFilterBuilder.BuildForwardFilter(ipv4Addresses, profile.Port, relayPort);
             var returnFilter = BypassFilterBuilder.BuildReturnFilter(relayPort);
             var dnsFilter = BypassFilterBuilder.BuildDnsFilter();
+            var udpBlockFilter = BypassFilterBuilder.BuildUdpBlockFilter();
 
             _dnsHandle = OpenHandleOrThrow(dnsFilter, WinDivertNative.Layer.Network, DnsPriority, WinDivertNative.OpenFlags.Drop, "DNS leak-protection");
+            // Additive, 2026-09-16: general UDP-block leak-protection handle
+            // - see BypassFilterBuilder.BuildUdpBlockFilter remarks for why
+            // this is a separate Drop handle rather than a change to the
+            // DNS handle above, and why blocking (not proxying) is correct
+            // given the current TCP-only upstream connectors. Like the DNS
+            // handle, this is Drop-only: the driver discards matching
+            // packets in-kernel, so there is no capture loop/thread for it
+            // and it cannot itself affect the verified TCP forward/return
+            // pipeline.
+            _udpBlockHandle = OpenHandleOrThrow(udpBlockFilter, WinDivertNative.Layer.Network, UdpBlockPriority, WinDivertNative.OpenFlags.Drop, "UDP-block leak-protection");
             _forwardHandle = OpenHandleOrThrow(forwardFilter, WinDivertNative.Layer.Network, ForwardPriority, WinDivertNative.OpenFlags.None, "forward");
             _returnHandle = OpenHandleOrThrow(returnFilter, WinDivertNative.Layer.Network, ReturnPriority, WinDivertNative.OpenFlags.None, "return");
 
@@ -367,6 +398,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         ShutdownReceive(_forwardHandle);
         ShutdownReceive(_returnHandle);
         ShutdownReceive(_dnsHandle);
+        ShutdownReceive(_udpBlockHandle);
 
         if (_forwardLoopTask is not null)
         {
@@ -381,6 +413,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         CloseHandle(ref _forwardHandle);
         CloseHandle(ref _returnHandle);
         CloseHandle(ref _dnsHandle);
+        CloseHandle(ref _udpBlockHandle);
 
         if (_relay is not null)
         {

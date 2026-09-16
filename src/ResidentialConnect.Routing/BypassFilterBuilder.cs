@@ -256,9 +256,74 @@ public static class BypassFilterBuilder
     /// running DNS-ish service on 127.0.0.1:53 is not something Whole
     /// Computer mode needs to intervene on, and would not represent a leak).
     /// See <see cref="DnsLeakGuard"/> for what happens to captured queries.
+    /// Deliberately UNCHANGED by the 2026-09-16 UDP-block addition below -
+    /// see <see cref="BuildUdpBlockFilter"/> remarks for why DNS/53 keeps its
+    /// own separate handle rather than being folded into the general UDP
+    /// block.
     /// </summary>
     public static string BuildDnsFilter()
     {
         return "outbound and !loopback and !impostor and udp and udp.DstPort == 53";
+    }
+
+    /// <summary>
+    /// Builds the filter for the general UDP-block leak-protection capture
+    /// handle (2026-09-16 addition): every other real, non-loopback outbound
+    /// UDP packet leaving the machine while Whole Computer mode is Active -
+    /// specifically excluding UDP/53 (already handled by its own,
+    /// unchanged, separate <see cref="BuildDnsFilter"/> handle, so the two
+    /// Drop handles never overlap the same packet).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why block ALL other UDP outright, additively, rather than proxy
+    /// it:</b> the current Residential Connect upstream implementation does
+    /// not proxy UDP. HTTP CONNECT is TCP-only, and our current SOCKS5
+    /// connector implements TCP CONNECT only; SOCKS5 UDP ASSOCIATE is not
+    /// implemented (see <see cref="ResidentialConnect.Proxy.Forwarding.Socks5UpstreamConnector"/>).
+    /// There is therefore no upstream path that could carry a redirected UDP
+    /// packet through the residential proxy at all - unlike TCP, where
+    /// <see cref="WinDivertSystemTrafficRouter"/>'s reflection technique
+    /// hands a redirected connection to <c>TransparentForwardingProxy</c>,
+    /// which opens a real upstream TCP tunnel. Given that constraint, the
+    /// only two options are: (a) let non-DNS UDP through unmodified, which
+    /// would let protocols like QUIC/HTTP-3 (UDP/443), WebRTC/STUN, or any
+    /// UDP-based application traffic reach the real network directly and
+    /// completely bypass the residential proxy even while Whole Computer
+    /// mode reports Active - a silent leak of exactly the kind the
+    /// product's fail-closed requirement forbids - or (b) block it. Per that
+    /// requirement ("never silently fall back to the user's real
+    /// connection"), (b) is the only consistent choice: an application using
+    /// QUIC (most modern browsers automatically retry over HTTP/2 or HTTP/1.1
+    /// on TCP/443 when UDP/443 is unreachable - the "fallback to TCP"
+    /// behavior this design deliberately relies on rather than reimplements)
+    /// or any other UDP protocol will see that traffic fail/time out rather
+    /// than silently egressing outside the proxy.
+    /// </para>
+    /// <para>
+    /// <b>Why this is a SEPARATE handle from the DNS-block handle, not a
+    /// single merged filter:</b> keeping <see cref="BuildDnsFilter"/>
+    /// completely unchanged (per the standing instruction not to modify
+    /// verified/working leak-protection behavior) was simpler and safer than
+    /// rewriting one combined filter string - two independent
+    /// <c>WinDivertNative.OpenFlags.Drop</c> handles with non-overlapping
+    /// <c>udp.DstPort</c> conditions (this one explicitly excludes 53) behave
+    /// identically to one combined filter would, without touching a single
+    /// already-verified line.
+    /// </para>
+    /// <para>
+    /// <b>Fail-closed, in-kernel, zero user-mode involvement:</b> exactly
+    /// like the DNS-block handle, this filter is opened with
+    /// <see cref="WinDivertNative.OpenFlags.Drop"/> - the WinDivert driver
+    /// itself silently drops every matching packet before it ever reaches
+    /// user mode. There is no capture loop, no thread, and no possibility of
+    /// a captured-but-not-yet-processed packet slipping through this handle,
+    /// unlike the forward/return TCP handles (which must actually inspect
+    /// and reflect packets in user mode).
+    /// </para>
+    /// </remarks>
+    public static string BuildUdpBlockFilter()
+    {
+        return "outbound and !loopback and udp and udp.DstPort != 53";
     }
 }
