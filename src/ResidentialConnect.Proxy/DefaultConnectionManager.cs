@@ -1,3 +1,4 @@
+using System.Net;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
@@ -230,28 +231,57 @@ public sealed class DefaultConnectionManager : IConnectionManager
 
         if (!verification.Success)
         {
-            _trafficRouter.StatusChanged -= OnRoutingStatusChanged;
-            _logger.Warning("ConnectionManager", $"Whole Computer post-routing verification FAILED for '{profile.Name}': {verification.FailureMessage}. Rolling routing back.");
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer post-routing verification FAILED for '{profile.Name}': {verification.FailureMessage}.",
+                verification.FailureMessage ?? "Whole Computer routing could not be verified. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
 
-            try
-            {
-                await _trafficRouter.StopAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.Error("ConnectionManager", "Error stopping whole-computer routing during verification-failure rollback.", ex);
-            }
+        // Success merely proving "some hostname-addressed HTTPS request
+        // reached the Internet" is NOT sufficient - a direct-bypass leak
+        // (the request escaping WinDivert interception and going straight
+        // out the real NIC/ISP path instead of through the residential
+        // proxy) would ALSO produce a successful, valid-looking response.
+        // For a dedicated static residential proxy product, the observed
+        // egress IP from THIS verification request must match the exit IP
+        // the earlier direct IProxyConnectivityTester pass already proved
+        // belongs to the selected proxy (result.ObservedPublicIp) - if it
+        // doesn't (or either IP is missing/unparseable), routing must be
+        // rolled back and reported as a failure, never silently accepted
+        // as "Connected" just because SOME public IP came back. IPs are
+        // compared as parsed System.Net.IPAddress values (not raw strings)
+        // so formatting differences (leading zeros, IPv4-mapped IPv6, etc.)
+        // never cause a false mismatch or a false match.
+        if (!TryParseIp(result.ObservedPublicIp, out var expectedProxyIp))
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer proxy-egress verification FAILED for '{profile.Name}': the earlier direct proxy connectivity test did not yield a parseable public IP ('{result.ObservedPublicIp}').",
+                "Could not establish the expected proxy egress IP from the initial connectivity test. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
 
-            var verificationFailedState = new ConnectionState
-            {
-                Status = ConnectionStatus.Error,
-                ActiveProxy = profile,
-                Mode = ConnectionMode.WholeComputer,
-                RoutingStatus = SystemRoutingStatus.Unavailable,
-                StatusMessage = verification.FailureMessage ?? "Whole Computer routing could not be verified. Routing has been rolled back."
-            };
-            SetState(verificationFailedState);
-            return verificationFailedState;
+        if (!TryParseIp(verification.ObservedPublicIp, out var actualEgressIp))
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer proxy-egress verification FAILED for '{profile.Name}': the post-routing hostname verification request did not return a parseable public IP ('{verification.ObservedPublicIp}').",
+                "Internet access worked, but the observed egress IP could not be determined, so it could not be confirmed to be the selected proxy's IP. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
+
+        if (!expectedProxyIp.Equals(actualEgressIp))
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer proxy-egress verification FAILED for '{profile.Name}': expected proxy exit IP '{expectedProxyIp}' but the routed hostname request egressed as '{actualEgressIp}' - possible direct-bypass leak (traffic reached the Internet WITHOUT going through the selected proxy). Rolling routing back.",
+                $"Internet access worked, but egress did not match the selected proxy (expected {expectedProxyIp}, observed {actualEgressIp}). This indicates a possible direct-bypass leak. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
         }
 
         var activeState = new ConnectionState
@@ -260,13 +290,72 @@ public sealed class DefaultConnectionManager : IConnectionManager
             ActiveProxy = profile,
             Mode = ConnectionMode.WholeComputer,
             RoutingStatus = SystemRoutingStatus.Active,
-            PublicIp = verification.ObservedPublicIp ?? result.ObservedPublicIp,
+            PublicIp = actualEgressIp.ToString(),
             Latency = result.Latency,
             StatusMessage = "Connected (Whole Computer)"
         };
-        _logger.Info("ConnectionManager", $"Whole Computer routing active and VERIFIED for '{profile.Name}'.");
+        _logger.Info("ConnectionManager", $"Whole Computer routing active and VERIFIED for '{profile.Name}' - proxy egress IP {actualEgressIp} confirmed via hostname-addressed request.");
         SetState(activeState);
         return activeState;
+    }
+
+    /// <summary>
+    /// Unsubscribes from routing-status events, stops (rolls back) an
+    /// already-Active <see cref="ISystemTrafficRouter"/>, logs, sets, and
+    /// returns an <see cref="ConnectionStatus.Error"/> state - the single
+    /// shared rollback path used by every post-Active verification failure
+    /// (verification itself failing, an unparseable expected/actual egress
+    /// IP, or an egress IP mismatch) so the UI is never told Connected
+    /// while routing is left dangling in an unverified Active state.
+    /// </summary>
+    private async Task<ConnectionState> RollBackWithErrorAsync(
+        ProxyProfile profile,
+        string logMessage,
+        string userMessage,
+        CancellationToken cancellationToken)
+    {
+        _trafficRouter!.StatusChanged -= OnRoutingStatusChanged;
+        _logger.Warning("ConnectionManager", logMessage);
+
+        try
+        {
+            await _trafficRouter.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("ConnectionManager", "Error stopping whole-computer routing during verification-failure rollback.", ex);
+        }
+
+        var failedState = new ConnectionState
+        {
+            Status = ConnectionStatus.Error,
+            ActiveProxy = profile,
+            Mode = ConnectionMode.WholeComputer,
+            RoutingStatus = SystemRoutingStatus.Unavailable,
+            StatusMessage = userMessage
+        };
+        SetState(failedState);
+        return failedState;
+    }
+
+    /// <summary>
+    /// Parses <paramref name="ipText"/> into an <see cref="IPAddress"/> for
+    /// comparison purposes. Deliberately used instead of raw string
+    /// equality for the proxy-egress-match check so textual formatting
+    /// differences (e.g. leading zeros in an octet) never cause a false
+    /// mismatch, and so a missing/malformed value is treated as "cannot
+    /// confirm" (fails closed) rather than silently comparing empty/garbage
+    /// strings.
+    /// </summary>
+    private static bool TryParseIp(string? ipText, out IPAddress address)
+    {
+        if (string.IsNullOrWhiteSpace(ipText))
+        {
+            address = IPAddress.None;
+            return false;
+        }
+
+        return IPAddress.TryParse(ipText.Trim(), out address!);
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken = default)

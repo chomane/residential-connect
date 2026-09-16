@@ -99,9 +99,60 @@ checkpoint is explicitly revised (with the new evidence recorded here).
 
 ---
 
+## ⚠️ SUPERSEDED / INVALID AS A FULL PRODUCT ACCEPTANCE CHECKPOINT ⚠️
+
 ## WHOLE COMPUTER V0.2 VERIFIED — commit `a686b4bf9a0c10c08b378a4c56b98cb9f0a54f32` (2026-09-16)
 
-**Status: Whole Computer (V0.2) is VERIFIED end-to-end on real Windows
+> **2026-09-16 correction (later the same day) — this checkpoint's "VERIFIED"
+> claim is SUPERSEDED and must NOT be relied on as evidence of full product
+> acceptance.** The historical evidence below is preserved unmodified for
+> the record, but it does not prove what the "VERIFIED end-to-end" language
+> originally claimed. Specifically:
+>
+> - The "TCP through residential proxy" / "Proxy egress verification (IP
+>   changed)" rows in the acceptance table below were produced by
+>   `tools/ResidentialConnect.RoutingDiagnostic` requesting a **hard-coded IP
+>   literal** (`https://1.1.1.1`, the tool's `DefaultTestUrl` at commit
+>   `a686b4b`) as the PRIMARY success gate - this never exercises real
+>   hostname DNS resolution at all, and is exactly the "IP-literal-only
+>   acceptance test" pattern the project's standing mandate now explicitly
+>   forbids ("no more IP-literal-only acceptance tests; no declaring Whole
+>   Computer verified until real hostname browsing works in the actual
+>   desktop app").
+> - At commit `a686b4b`, outbound UDP/53 DNS was handled by an outright
+>   WinDivert **Drop** ("blocked", per `DnsLeakGuard`'s policy at that
+>   time) - it was never actually, functionally proxied. The "UDP/53 (DNS)
+>   leak block while Active" PASS row below is real evidence that DNS was
+>   *blocked* (not leaked), but it is NOT evidence that DNS resolution
+>   *worked* through the proxy while Whole Computer mode was Active - a
+>   real desktop application depending on working DNS (i.e. almost every
+>   real application) would have been unable to resolve any hostname at
+>   all during that Active session, which this checkpoint's "VERIFIED"
+>   language did not make clear.
+> - Net effect: this checkpoint proves the **TCP reflection/redirect
+>   pipeline** (already independently established by the `145c130`
+>   checkpoint below, which remains the known-good TCP-routing baseline)
+>   plus **fail-closed UDP blocking**, but it does **NOT** constitute a
+>   valid full Whole Computer product acceptance run, because it never
+>   proved that an ordinary, unmodified desktop application's normal
+>   hostname-based browsing (DNS resolution + HTTPS to that resolved
+>   address) actually works while Whole Computer mode is Active.
+>
+> **The next "WHOLE COMPUTER VERIFIED" checkpoint can only be established
+> after the corrected desktop acceptance procedure passes on real Windows
+> hardware** - specifically: (1) a real hostname-addressed HTTPS request
+> succeeds while Active (`HOSTNAME-HTTPS-ACTIVE`), (2) DNS for that request
+> is actually answered via the new proxied DNS-over-HTTPS path (not
+> blocked), (3) the observed egress IP for that request exactly matches the
+> proxy's own independently-established exit IP (`PROXY-EGRESS-MATCH`),
+> and (4) the `DefaultConnectionManager` UI-facing acceptance path itself
+> (not just the standalone diagnostic tool) reports Connected only after
+> that same hostname+egress verification succeeds. None of this has been
+> run on real Windows hardware as of this correction - see the "Pending"
+> section of the current PR for the up-to-date status.
+
+**Status (as originally recorded, 2026-09-16 - see correction above): Whole
+Computer (V0.2) is VERIFIED end-to-end on real Windows
 10/11 x64 hardware for TCP proxying AND fail-closed UDP/DNS/QUIC leak
 protection**, superseding the TCP-only checkpoint above with a full-scope
 result. This is the acceptance run of
@@ -182,7 +233,44 @@ All files listed under "TCP VERIFIED — `145c130`" above, **plus**:
   acceptance sequence (TCP + UDP/DNS + QUIC steps and the
   `=== ACCEPTANCE SUMMARY ===` banner) that produced this evidence.
 
-**This is now the standing baseline for all further Whole Computer mode
-work.** Any future change must be strictly additive to the files listed
-above (both checkpoints combined) unless a new real-Windows diagnostic run
-produces contradicting evidence and this checkpoint is explicitly revised.
+**(As originally recorded.) This was claimed as the standing baseline for
+all further Whole Computer mode work** - per the SUPERSEDED notice at the
+top of this section, that claim is now corrected: the TCP-reflection and
+UDP-block files listed here remain a valid, real-Windows-verified baseline
+for those specific mechanisms, but this checkpoint as a whole must not be
+cited as proof of full Whole Computer product acceptance. `145c130`
+remains the known-good TCP-routing checkpoint. Any future change must
+still be strictly additive to the files listed above (both checkpoints
+combined) unless a new real-Windows diagnostic run produces contradicting
+evidence.
+
+---
+
+## Next checkpoint: not yet established
+
+No "WHOLE COMPUTER VERIFIED" checkpoint currently exists. Per the
+SUPERSEDED notice above, the next one can only be recorded after a real
+Windows desktop-app acceptance run demonstrates, together, on real
+hardware:
+
+1. `HOSTNAME-HTTPS-ACTIVE` — a real, hostname-addressed HTTPS request
+   (not an IP literal) succeeds while Whole Computer routing reports
+   Active, with DNS for that hostname actually answered through the new
+   proxied DNS-over-HTTPS path (`ProxiedDohResolver`) rather than blocked.
+2. `PROXY-EGRESS-MATCH` — the observed egress IP for that same request
+   exactly matches the residential proxy's own, independently-established
+   exit IP (parsed `IPAddress` equality, not raw string comparison).
+3. Public UDP (general), public IPv6, and unsupported public IPv4
+   protocols remain blocked (fail-closed) while Active, and normal
+   hostname DNS/HTTPS/UDP networking is fully restored after `StopAsync()`.
+4. The desktop app's own `DefaultConnectionManager.ConnectAsync` flow -
+   not just the standalone `RoutingDiagnostic` tool - only ever reports
+   `ConnectionStatus.Connected` after this same hostname+egress
+   verification succeeds, with `PROXY-EGRESS-MATCH`'s check performed via
+   parsed `IPAddress` comparison of `IWholeComputerConnectivityVerifier`'s
+   result against the proxy's `IProxyConnectivityTester` result.
+
+Windows-native WinDivert filter compilation (against the real
+`WinDivertHelperCompileFilter` native parser) and this full desktop
+acceptance run both remain **pending** as of this correction - see the
+current PR for status.

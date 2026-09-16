@@ -95,13 +95,15 @@ public class DefaultConnectionManagerTests
     }
 
     [Fact]
-    public async Task ConnectAsync_WholeComputer_VerificationSucceeds_ReportsConnectedWithVerifiedPublicIp()
+    public async Task ConnectAsync_WholeComputer_VerificationSucceeds_AndEgressMatchesProxy_ReportsConnectedWithVerifiedPublicIp()
     {
         // The reported PublicIp must come from the VERIFICATION call (the
         // one that actually proved traffic flows end-to-end through the
-        // now-Active routing), not merely from the earlier direct-to-proxy
-        // connectivity test.
-        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("198.51.100.1", TimeSpan.FromMilliseconds(10)) };
+        // now-Active routing) - but ONLY when that IP matches the proxy
+        // exit IP the earlier direct-to-proxy connectivity test already
+        // established. Here they intentionally match: expected proxy IP ==
+        // active verification IP -> Connected.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("203.0.113.42", TimeSpan.FromMilliseconds(10)) };
         var credentialStore = new InMemoryCredentialStore();
         credentialStore.Save("cred-1", "s3cr3t");
         var router = new FakeSystemTrafficRouter();
@@ -112,6 +114,128 @@ public class DefaultConnectionManagerTests
 
         Assert.Equal(ConnectionStatus.Connected, state.Status);
         Assert.Equal("203.0.113.42", state.PublicIp);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerificationSucceeds_ButEgressMatchesViaDifferentTextualFormatting_StillReportsConnected()
+    {
+        // IPs must be compared as PARSED IPAddress values, not raw strings -
+        // "203.0.113.007" and "203.0.113.7" are the same address once
+        // parsed (leading zero in the last octet), and must be treated as
+        // a match, not a false mismatch.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("203.0.113.007", TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful("203.0.113.7") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Connected, state.Status);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_EgressIpDoesNotMatchProxy_ReportsErrorAndRollsRoutingBack()
+    {
+        // Critical false-positive guard: a successful, valid-looking
+        // hostname HTTPS response is NOT sufficient proof of correct
+        // routing if the observed egress IP does not match the exit IP the
+        // earlier direct proxy connectivity test already established for
+        // THIS specific proxy - that pattern is exactly what a
+        // direct-bypass leak (traffic escaping WinDivert interception and
+        // going out the real ISP path instead of through the proxy) would
+        // look like. Expected proxy IP != active verification IP -> never
+        // Connected; roll routing back.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("203.0.113.9", TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful("198.51.100.77") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Error, state.Status);
+        Assert.Equal(SystemRoutingStatus.Unavailable, state.RoutingStatus);
+        Assert.Equal(1, router.StartCallCount);
+        Assert.Equal(1, router.StopCallCount);
+        Assert.Contains("egress", state.StatusMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rolled back", state.StatusMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_EgressIpMismatch_NeverLeavesTheUIInConnectedState()
+    {
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("203.0.113.9", TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful("198.51.100.77") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.NotEqual(ConnectionStatus.Connected, manager.CurrentState.Status);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerificationReturnsMalformedIp_ReportsErrorAndRollsRoutingBack()
+    {
+        // A verification result that reports Success=true but returns a
+        // malformed/unparseable IP string must fail closed exactly like a
+        // genuine mismatch - "some text came back" is not proof of correct
+        // proxy egress.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("203.0.113.9", TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful("not-an-ip-address") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Error, state.Status);
+        Assert.Equal(1, router.StopCallCount);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerificationReturnsMissingIp_ReportsErrorAndRollsRoutingBack()
+    {
+        // Success=true but ObservedPublicIp is null/empty - also must fail
+        // closed rather than being treated as an automatic match.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("203.0.113.9", TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful(null) };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Error, state.Status);
+        Assert.Equal(1, router.StopCallCount);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_InitialProxyTestIpIsMalformed_ReportsErrorAndRollsRoutingBack()
+    {
+        // Defensive symmetry: even if verification itself returns a
+        // perfectly valid IP, if the EARLIER direct proxy connectivity
+        // test's ObservedPublicIp was missing/malformed there is no valid
+        // "expected proxy IP" to compare against - fail closed rather than
+        // silently skipping the comparison.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful(null!, TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful("203.0.113.9") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Error, state.Status);
+        Assert.Equal(1, router.StopCallCount);
     }
 
     [Fact]

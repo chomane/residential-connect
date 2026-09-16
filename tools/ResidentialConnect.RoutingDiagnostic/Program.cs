@@ -8,8 +8,10 @@ using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Common;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
+using ResidentialConnect.Proxy;
 using ResidentialConnect.Proxy.Dns;
 using ResidentialConnect.Proxy.Forwarding;
+using ResidentialConnect.Proxy.IpEcho;
 using ResidentialConnect.Proxy.Repository;
 using ResidentialConnect.Routing;
 using ResidentialConnect.Security.DataProtection;
@@ -71,7 +73,19 @@ namespace ResidentialConnect.RoutingDiagnostic;
 [SupportedOSPlatform("windows")]
 internal static class Program
 {
-    private const string DefaultTestUrl = "https://1.1.1.1";
+    // 2026-09-16 correction: the PRIMARY Whole Computer success gate must be
+    // a real, hostname-addressed HTTPS request - an IP literal (the
+    // original https://1.1.1.1 default) never exercises DNS resolution at
+    // all, and this exact IP-literal-only acceptance pattern is what
+    // produced the now-SUPERSEDED "WHOLE COMPUTER V0.2 VERIFIED" checkpoint
+    // (see docs/CHECKPOINTS.md). https://example.com/ is a stable, widely
+    // available hostname target with no login/redirect/anti-bot friction.
+    private const string DefaultHostnameTestUrl = "https://example.com/";
+    // Retained ONLY as an additional, non-gating low-level TCP/IP-literal
+    // diagnostic (useful for isolating "is raw TCP reflection working at
+    // all" from "does hostname DNS resolution+HTTPS work") - it must never
+    // be the thing that decides overall PASS/FAIL. See Step 3b below.
+    private const string DefaultIpLiteralDiagnosticUrl = "https://1.1.1.1";
     private const string IpEchoUrl = "https://api.ipify.org";
     private const string DefaultDnsProbeServerIp = "1.1.1.1";
     private const string DefaultDnsProbeHostName = "example.com";
@@ -89,13 +103,18 @@ internal static class Program
         Environment.SetEnvironmentVariable("RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS", "1");
 
         Console.WriteLine("=== Residential Connect - Whole Computer routing diagnostic ===");
-        Console.WriteLine("This tool automates the TCP acceptance test from the 2026-09-15");
-        Console.WriteLine("handoff (connect Whole Computer mode, make a real TCP/TLS request");
-        Console.WriteLine("from an ordinary HttpClient, verify it succeeds and egresses via");
-        Console.WriteLine("the proxy, then disconnect and verify normal networking is");
-        Console.WriteLine("restored) PLUS the 2026-09-16 UDP/DNS leak-protection checks: a");
-        Console.WriteLine("raw UDP/53 DNS probe before/while/after routing, and an HTTP/3");
-        Console.WriteLine("(UDP/443 QUIC) probe while routing is Active.");
+        Console.WriteLine("This tool's PRIMARY success gate (2026-09-16 correction) is now a real,");
+        Console.WriteLine("HOSTNAME-addressed HTTPS request (default https://example.com/, NOT an IP");
+        Console.WriteLine("literal) made from an ordinary HttpClient with no proxy configured on it,");
+        Console.WriteLine("whose observed egress IP is then required to EXACTLY MATCH the proxy's own");
+        Console.WriteLine("exit IP (established via a direct connectivity test before routing even");
+        Console.WriteLine("starts) - see HOSTNAME-HTTPS-ACTIVE and PROXY-EGRESS-MATCH below. A prior");
+        Console.WriteLine("IP-literal-only version of this test produced a now-SUPERSEDED checkpoint");
+        Console.WriteLine("(see docs/CHECKPOINTS.md) - that mistake is not repeated here: an IP-literal");
+        Console.WriteLine("request (Step 3b) is kept ONLY as an informational, non-gating diagnostic.");
+        Console.WriteLine("Also includes the 2026-09-16 UDP/DNS leak-protection checks: a raw UDP/53");
+        Console.WriteLine("DNS probe before/while/after routing, and an HTTP/3 (UDP/443 QUIC) probe");
+        Console.WriteLine("while routing is Active.");
         Console.WriteLine();
 
         var options = DiagnosticOptions.Parse(args);
@@ -141,6 +160,29 @@ internal static class Program
         }
         WriteResult("PROFILE", CheckOutcome.Pass, $"Using profile '{profile.Name}' ({profile.Host}:{profile.Port}, {profile.Protocol}).");
 
+        // ---- Establish the EXPECTED proxy egress IP directly (same       ----
+        // ---- IProxyConnectivityTester DefaultConnectionManager itself     ----
+        // ---- uses before ever starting Whole Computer routing) -----------
+        // This is the ground truth PROXY-EGRESS-MATCH below is checked
+        // against - "hostname HTTPS succeeded while Active" is NOT
+        // sufficient proof by itself; the observed egress IP must also
+        // equal the IP this direct-to-proxy test independently establishes
+        // belongs to the selected proxy, or a direct-bypass leak (traffic
+        // escaping WinDivert interception and reaching the Internet via
+        // the real ISP path instead of the proxy) would look identical to
+        // a genuine pass.
+        Console.WriteLine();
+        Console.WriteLine("--- Step 1a: establishing the expected proxy egress IP (direct proxy connectivity test) ---");
+        var proxyTester = new HttpProxyConnectivityTester(credentialStore, new IpifyEchoService(), logger);
+        using var proxyBaselineCts = new CancellationTokenSource(TimeSpan.FromSeconds(options.TimeoutSeconds * 2));
+        var proxyTestResult = await proxyTester.TestAsync(profile, proxyBaselineCts.Token);
+        if (!proxyTestResult.Success || string.IsNullOrWhiteSpace(proxyTestResult.ObservedPublicIp) || !IPAddress.TryParse(proxyTestResult.ObservedPublicIp.Trim(), out var expectedProxyIp))
+        {
+            WriteResult("PROXY-EGRESS-BASELINE", CheckOutcome.Fail, $"Could not establish the expected proxy egress IP via a direct connectivity test: {proxyTestResult.Message ?? "no public IP observed"}. Cannot proceed - PROXY-EGRESS-MATCH below would have nothing trustworthy to compare against.");
+            return 1;
+        }
+        WriteResult("PROXY-EGRESS-BASELINE", CheckOutcome.Pass, $"Expected proxy egress IP is {expectedProxyIp} (established via a direct-to-proxy connectivity test, independent of Whole Computer routing).");
+
         var stateMarkerPath = Path.Combine(AppPaths.RootDirectory, "routing-diagnostic.marker");
         var stateMarker = new RoutingStateMarker(stateMarkerPath, logger);
         var router = new WinDivertSystemTrafficRouter(
@@ -169,14 +211,23 @@ internal static class Program
         // skims straight to the bottom of the output.
         var summary = new AcceptanceSummary();
 
-        // ---- Baseline: direct TCP request BEFORE enabling routing ------
+        // ---- Baseline: direct HOSTNAME-addressed HTTPS request BEFORE  ----
+        // ---- enabling routing (the PRIMARY gate target, not an IP     ----
+        // ---- literal) ------------------------------------------------------
+        // 2026-09-16 correction: the original baseline/routed pair used an
+        // IP literal (https://1.1.1.1) as the PRIMARY success gate, which
+        // never exercises DNS resolution at all - a leak where hostname
+        // DNS/HTTPS bypasses the proxy entirely could still look like a
+        // pass. options.HostnameTestUrl (default https://example.com/) is
+        // now the primary gate; the IP-literal check (Step 3b) is kept
+        // ONLY as an additional, explicitly non-gating low-level diagnostic.
         Console.WriteLine();
-        Console.WriteLine("--- Step 1: baseline TCP/HTTPS request (routing NOT yet active) ---");
-        var baseline = await TryHttpsRequestAsync(options.TestUrl, options.TimeoutSeconds, timeoutCts.Token);
-        WriteResult("BASELINE-REQUEST", ToOutcome(baseline.Success), baseline.Detail);
+        Console.WriteLine($"--- Step 1: baseline hostname-addressed HTTPS request to {options.HostnameTestUrl} (routing NOT yet active) ---");
+        var baseline = await TryHttpsRequestAsync(options.HostnameTestUrl, options.TimeoutSeconds, timeoutCts.Token);
+        WriteResult("HOSTNAME-HTTPS-BASELINE", ToOutcome(baseline.Success), baseline.Detail);
         if (!baseline.Success)
         {
-            Console.WriteLine("Baseline request itself failed - this indicates a pre-existing network problem unrelated to Whole Computer mode. Fix your network connectivity before re-running this diagnostic.");
+            Console.WriteLine("Baseline hostname request itself failed - this indicates a pre-existing network/DNS problem unrelated to Whole Computer mode. Fix your network connectivity before re-running this diagnostic.");
             return 1;
         }
 
@@ -234,25 +285,28 @@ internal static class Program
 
         try
         {
-            // ---- The actual TCP acceptance test: real TCP/TLS through reflection ----
+            // ---- The PRIMARY Whole Computer success gate: real hostname ----
+            // ---- DNS resolution + HTTPS through reflection --------------------
             Console.WriteLine();
-            Console.WriteLine($"--- Step 3: request to {options.TestUrl} WHILE Whole Computer mode reports Active ---");
+            Console.WriteLine($"--- Step 3: hostname-addressed HTTPS request to {options.HostnameTestUrl} WHILE Whole Computer mode reports Active ---");
             Console.WriteLine("    (This uses an ordinary HttpClient with NO proxy configured on it at all -");
-            Console.WriteLine("     exactly like curl.exe or any other unaware Windows application. If the");
-            Console.WriteLine("     WinDivert reflection fix works, the kernel transparently redirects this");
-            Console.WriteLine("     connection through the local relay and upstream proxy without this");
-            Console.WriteLine("     process's HttpClient knowing anything happened.)");
-            var routed = await TryHttpsRequestAsync(options.TestUrl, options.TimeoutSeconds, timeoutCts.Token);
-            WriteResult("ROUTED-REQUEST", ToOutcome(routed.Success), routed.Detail);
-            summary.TcpRoutedThroughProxy = routed.Success;
+            Console.WriteLine("     exactly like curl.exe or any other unaware Windows application, resolving");
+            Console.WriteLine("     a REAL hostname via the OS resolver. If the WinDivert reflection fix AND");
+            Console.WriteLine("     the proxied-DoH DNS capture both work, the kernel transparently redirects");
+            Console.WriteLine("     both the DNS query and the TCP/TLS connection through the local relay and");
+            Console.WriteLine("     upstream proxy without this process's HttpClient knowing anything happened.)");
+            var hostnameRouted = await TryHttpsRequestAsync(options.HostnameTestUrl, options.TimeoutSeconds, timeoutCts.Token);
+            WriteResult("HOSTNAME-HTTPS-ACTIVE", ToOutcome(hostnameRouted.Success), hostnameRouted.Detail);
+            summary.HostnameHttpsActive = hostnameRouted.Success;
 
-            if (!routed.Success)
+            if (!hostnameRouted.Success)
             {
                 Console.WriteLine();
                 Console.WriteLine("    DIAGNOSIS HINTS based on the failure mode above:");
-                Console.WriteLine("      - Timeout / no response at all  -> reflection is likely not completing");
-                Console.WriteLine("        the SYN/SYN-ACK handshake (same symptom as the original bug this fix");
-                Console.WriteLine("        targets). Check WinDivertSystemTrafficRouter's forward/return filters");
+                Console.WriteLine("      - Timeout / no response at all  -> reflection or DNS capture is likely");
+                Console.WriteLine("        not completing (same symptom class as the original TCP reflection bug,");
+                Console.WriteLine("        or the DNS capture/proxied-DoH path is failing). Check");
+                Console.WriteLine("        WinDivertSystemTrafficRouter's forward/return AND DNS-capture filters");
                 Console.WriteLine("        actually matched (enable more verbose logging) and confirm the");
                 Console.WriteLine("        process is truly elevated with the WinDivert driver loaded.");
                 Console.WriteLine("      - Connection reset shortly after connecting -> matches the checkpoint's");
@@ -262,26 +316,54 @@ internal static class Program
                 Console.WriteLine("        exact test run and compare against streamdump.c's expected sequence.");
             }
 
-            if (routed.Success && !options.SkipIpCheck)
+            // ---- Step 3b (NON-GATING, low-level diagnostic only): the ----
+            // ---- retained IP-literal TCP/TLS request. This exercises   ----
+            // ---- raw TCP reflection without any DNS-capture dependency, ----
+            // ---- which is useful for narrowing down a HOSTNAME-HTTPS-ACTIVE ----
+            // ---- failure to "DNS capture broken" (this passes, hostname ----
+            // ---- fails) vs. "TCP reflection itself broken" (both fail). ----
+            // ---- Its outcome is reported but NEVER included in         ----
+            // ---- AllRequiredChecksPassed() - an IP-literal-only result  ----
+            // ---- must never again be treated as the Whole Computer      ----
+            // ---- success gate (see docs/CHECKPOINTS.md SUPERSEDED note).----
+            Console.WriteLine();
+            Console.WriteLine($"--- Step 3b (informational, NON-GATING): IP-literal TCP/TLS request to {options.IpLiteralDiagnosticUrl} WHILE Active ---");
+            Console.WriteLine("    (Low-level diagnostic only - narrows down a HOSTNAME-HTTPS-ACTIVE failure to");
+            Console.WriteLine("     \"DNS capture broken\" vs. \"TCP reflection itself broken\". This result is NEVER");
+            Console.WriteLine("     counted toward the overall PASS/FAIL decision - see docs/CHECKPOINTS.md for why");
+            Console.WriteLine("     an IP-literal-only result was previously (incorrectly) treated as sufficient.)");
+            var ipLiteralRouted = await TryHttpsRequestAsync(options.IpLiteralDiagnosticUrl, options.TimeoutSeconds, timeoutCts.Token);
+            WriteResult("IP-LITERAL-TCP-DIAGNOSTIC (informational only)", ToOutcome(ipLiteralRouted.Success), ipLiteralRouted.Detail);
+
+            if (hostnameRouted.Success && !options.SkipIpCheck)
             {
                 Console.WriteLine();
-                Console.WriteLine($"--- Step 4: verifying egress IP actually changed (via {IpEchoUrl}) ---");
+                Console.WriteLine($"--- Step 4: verifying proxy egress IP (via {IpEchoUrl}) matches the expected proxy IP established in Step 1a ---");
                 var routedIpResult = await TryHttpsRequestAsync(IpEchoUrl, options.TimeoutSeconds, timeoutCts.Token);
-                if (routedIpResult.Success)
+                if (routedIpResult.Success && IPAddress.TryParse(routedIpResult.ResponseBody?.Trim(), out var actualEgressIp))
                 {
-                    var routedIp = routedIpResult.ResponseBody?.Trim();
-                    var ipChanged = !string.IsNullOrEmpty(routedIp) && !string.Equals(routedIp, baselineIp, StringComparison.Ordinal);
-                    WriteResult("EGRESS-IP-CHANGED", ToOutcome(ipChanged),
-                        ipChanged
-                            ? $"Baseline IP was {baselineIp}; routed IP is {routedIp} - traffic is genuinely egressing via the proxy."
-                            : $"Baseline IP was {baselineIp}; routed IP is ALSO {routedIp} - traffic is NOT actually going through the proxy (leak), even though the HTTPS request itself succeeded. This is a fail-closed violation and must be investigated before trusting this mode.");
-                    summary.ProxyEgressVerified = ipChanged;
+                    var egressMatches = actualEgressIp.Equals(expectedProxyIp);
+                    WriteResult("PROXY-EGRESS-MATCH", ToOutcome(egressMatches),
+                        egressMatches
+                            ? $"Expected proxy egress IP ({expectedProxyIp}, from Step 1a) matches the observed routed egress IP ({actualEgressIp}) - traffic is genuinely egressing via the selected proxy, not merely reaching the Internet by some other path."
+                            : $"MISMATCH: expected proxy egress IP was {expectedProxyIp} (Step 1a) but the routed hostname request egressed as {actualEgressIp}. Internet access worked, but egress did NOT match the selected proxy - this is a possible DIRECT-BYPASS LEAK (traffic reached the Internet without actually going through the proxy) and must be investigated before trusting this mode. Also note the raw baseline (direct, pre-routing) IP was {baselineIp ?? "(unknown)"}.");
+                    summary.ProxyEgressMatch = egressMatches;
                 }
                 else
                 {
-                    WriteResult("EGRESS-IP-CHANGED", CheckOutcome.Fail, $"Could not reach {IpEchoUrl} while routed: {routedIpResult.Detail}");
-                    summary.ProxyEgressVerified = false;
+                    WriteResult("PROXY-EGRESS-MATCH", CheckOutcome.Fail, $"Could not obtain a parseable egress IP from {IpEchoUrl} while routed: {routedIpResult.Detail}");
+                    summary.ProxyEgressMatch = false;
                 }
+            }
+            else if (!options.SkipIpCheck)
+            {
+                // hostnameRouted failed - PROXY-EGRESS-MATCH cannot be
+                // meaningfully attempted, and must be reported as an
+                // explicit FAIL (never SKIP - a hostname failure is a real
+                // acceptance failure, and leaving this check silently
+                // unreported would look identical to "was never checked").
+                WriteResult("PROXY-EGRESS-MATCH", CheckOutcome.Fail, "Skipped attempting the check because the hostname-addressed request (HOSTNAME-HTTPS-ACTIVE) itself failed - reported as FAIL, not SKIP, since egress cannot be confirmed to match the proxy when the routed request never even succeeded.");
+                summary.ProxyEgressMatch = false;
             }
 
             // ---- NEW Step 4b: UDP/53 DNS must now be BLOCKED (fail-closed) ----
@@ -334,19 +416,19 @@ internal static class Program
         WriteResult("UDP-DNS-RESTORED-AFTER-DISCONNECT", ToOutcome(udpRestored.Responded), udpRestored.Detail);
         summary.UdpDnsRestoredAfterDisconnect = udpRestored.Responded;
 
-        // ---- Confirm normal TCP networking is restored -----------------
+        // ---- Confirm normal HOSTNAME-addressed networking is restored ----
         Console.WriteLine();
-        Console.WriteLine("--- Step 6: confirming normal (direct) TCP networking is restored after disconnect ---");
-        var restored = await TryHttpsRequestAsync(options.TestUrl, options.TimeoutSeconds, timeoutCts.Token);
-        WriteResult("POST-DISCONNECT-REQUEST", ToOutcome(restored.Success), restored.Detail);
-        summary.TcpRestoredAfterDisconnect = restored.Success;
+        Console.WriteLine($"--- Step 6: confirming normal (direct) hostname-addressed HTTPS networking to {options.HostnameTestUrl} is restored after disconnect ---");
+        var restored = await TryHttpsRequestAsync(options.HostnameTestUrl, options.TimeoutSeconds, timeoutCts.Token);
+        WriteResult("HOSTNAME-HTTPS-RESTORED-AFTER-DISCONNECT", ToOutcome(restored.Success), restored.Detail);
+        summary.HostnameHttpsRestoredAfterDisconnect = restored.Success;
 
         PrintAcceptanceSummary(summary);
 
         var allPassed = summary.AllRequiredChecksPassed();
         Console.WriteLine();
         Console.WriteLine(allPassed
-            ? "=== OVERALL RESULT: PASS - Whole Computer mode routed real TCP traffic, blocked UDP leaks, and cleaned up correctly. ==="
+            ? "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, blocked UDP/public-IPv6 leaks, and cleaned up correctly. ==="
             : "=== OVERALL RESULT: FAIL - see the failed step(s) and acceptance summary above. Do NOT consider Whole Computer mode / PR #3 verified. ===");
 
         return allPassed ? 0 : 1;
@@ -581,24 +663,31 @@ internal static class Program
 
     /// <summary>
     /// Prints the final, clearly-separated acceptance summary banner - the
-    /// six independent results the acceptance test explicitly cares about,
-    /// each reported on its own line regardless of which step above
+    /// seven independent results the acceptance test explicitly cares
+    /// about, each reported on its own line regardless of which step above
     /// produced it, so a reader does not have to reconstruct the outcome by
-    /// scanning the full step-by-step log.
+    /// scanning the full step-by-step log. 2026-09-16 correction: renamed
+    /// "TCP routed through proxy"/"Proxy egress verified (IP changed)" to
+    /// HOSTNAME-HTTPS-ACTIVE/PROXY-EGRESS-MATCH - these are now the PRIMARY
+    /// gate (hostname DNS+HTTPS while Active, AND the observed egress IP
+    /// exactly matching the proxy's independently-established exit IP from
+    /// Step 1a), not merely "some IP changed from baseline". The retained
+    /// IP-literal diagnostic (Step 3b) is deliberately NOT included here -
+    /// it is informational only and never gates PASS/FAIL.
     /// </summary>
     private static void PrintAcceptanceSummary(AcceptanceSummary summary)
     {
         Console.WriteLine();
         Console.WriteLine("=== ACCEPTANCE SUMMARY ===");
-        WriteSummaryLine("TCP routed through proxy", ToOutcome(summary.TcpRoutedThroughProxy));
-        WriteSummaryLine("Proxy egress verified (IP changed)", ToOutcome(summary.ProxyEgressVerified));
-        WriteSummaryLine("UDP/53 (DNS) blocked while Active", ToOutcome(summary.UdpDns53BlockedWhileActive));
-        WriteSummaryLine("General UDP/QUIC (HTTP/3) blocked while Active", summary.UdpQuicOutcome);
+        WriteSummaryLine("HOSTNAME-HTTPS-ACTIVE (real hostname DNS+HTTPS routed through proxy)", ToOutcome(summary.HostnameHttpsActive));
+        WriteSummaryLine("PROXY-EGRESS-MATCH (observed egress IP == proxy's established exit IP)", ToOutcome(summary.ProxyEgressMatch));
+        WriteSummaryLine("UDP/53 (DNS) direct-leak blocked while Active", ToOutcome(summary.UdpDns53BlockedWhileActive));
+        WriteSummaryLine("General UDP/QUIC (public UDP) bypass blocked while Active", summary.UdpQuicOutcome);
+        WriteSummaryLine("Hostname DNS/HTTPS restored after disconnect", ToOutcome(summary.HostnameHttpsRestoredAfterDisconnect));
         WriteSummaryLine("UDP restored after disconnect", ToOutcome(summary.UdpDnsRestoredAfterDisconnect));
-        WriteSummaryLine("TCP restored after disconnect", ToOutcome(summary.TcpRestoredAfterDisconnect));
         if (!summary.UdpDnsBaselineWorked)
         {
-            Console.WriteLine("    NOTE: the pre-routing raw UDP/53 baseline itself failed - the 'UDP/53 blocked while Active' result above is NOT reliable evidence of this app's leak protection (see Step 1b).");
+            Console.WriteLine("    NOTE: the pre-routing raw UDP/53 baseline itself failed - the 'UDP/53 direct-leak blocked while Active' result above is NOT reliable evidence of this app's leak protection (see Step 1b).");
         }
     }
 
@@ -621,34 +710,45 @@ internal static class Program
     }
 
     /// <summary>
-    /// Tracks the six independent results the acceptance test's final
-    /// summary banner must report, plus the pre-routing UDP baseline used
-    /// only to qualify (not gate) the "blocked while Active" result.
+    /// Tracks the independent results the acceptance test's final summary
+    /// banner must report, plus the pre-routing UDP baseline used only to
+    /// qualify (not gate) the "blocked while Active" result. 2026-09-16
+    /// correction: HostnameHttpsActive/ProxyEgressMatch/
+    /// HostnameHttpsRestoredAfterDisconnect replace the previous
+    /// IP-literal-based TcpRoutedThroughProxy/ProxyEgressVerified/
+    /// TcpRestoredAfterDisconnect fields as the PRIMARY, gating results - a
+    /// hostname failure or an egress-IP mismatch is always a real FAIL,
+    /// never SKIP.
     /// </summary>
     private sealed class AcceptanceSummary
     {
         public bool UdpDnsBaselineWorked { get; set; }
-        public bool TcpRoutedThroughProxy { get; set; }
-        public bool ProxyEgressVerified { get; set; }
+        public bool HostnameHttpsActive { get; set; }
+        public bool ProxyEgressMatch { get; set; }
         public bool UdpDns53BlockedWhileActive { get; set; }
         public CheckOutcome UdpQuicOutcome { get; set; } = CheckOutcome.Fail;
         public bool UdpDnsRestoredAfterDisconnect { get; set; }
-        public bool TcpRestoredAfterDisconnect { get; set; }
+        public bool HostnameHttpsRestoredAfterDisconnect { get; set; }
 
         /// <summary>
         /// Overall PASS requires every required check to have passed. The
         /// UDP/QUIC check is the one exception: SKIP (a genuine, detected
         /// capability limitation - HTTP/3 unavailable on this machine) does
         /// NOT fail the overall run, but an actual FAIL (a real leak, or an
-        /// unexpected error while HTTP/3 was attemptable) still does.
+        /// unexpected error while HTTP/3 was attemptable) still does. A
+        /// hostname-request failure or a proxy-egress mismatch is ALWAYS a
+        /// real FAIL here (HostnameHttpsActive/ProxyEgressMatch are plain
+        /// booleans, never SKIP) - per the standing "no more
+        /// IP-literal-only acceptance tests" mandate, these two are now the
+        /// non-negotiable core of the gate.
         /// </summary>
         public bool AllRequiredChecksPassed() =>
-            TcpRoutedThroughProxy
-            && ProxyEgressVerified
+            HostnameHttpsActive
+            && ProxyEgressMatch
             && UdpDns53BlockedWhileActive
             && UdpQuicOutcome != CheckOutcome.Fail
             && UdpDnsRestoredAfterDisconnect
-            && TcpRestoredAfterDisconnect;
+            && HostnameHttpsRestoredAfterDisconnect;
     }
 
     private sealed record RequestResult(bool Success, string Detail, string? ResponseBody);
@@ -669,7 +769,8 @@ internal static class Program
 
     private sealed class DiagnosticOptions
     {
-        public string TestUrl { get; private init; } = DefaultTestUrl;
+        public string HostnameTestUrl { get; private init; } = DefaultHostnameTestUrl;
+        public string IpLiteralDiagnosticUrl { get; private init; } = DefaultIpLiteralDiagnosticUrl;
         public int TimeoutSeconds { get; private init; } = DefaultTimeoutSeconds;
         public int UdpTimeoutSeconds { get; private init; } = DefaultUdpTimeoutSeconds;
         public bool SkipIpCheck { get; private init; }
@@ -680,7 +781,8 @@ internal static class Program
 
         public static DiagnosticOptions? Parse(string[] args)
         {
-            string testUrl = DefaultTestUrl;
+            string hostnameTestUrl = DefaultHostnameTestUrl;
+            string ipLiteralDiagnosticUrl = DefaultIpLiteralDiagnosticUrl;
             int timeoutSeconds = DefaultTimeoutSeconds;
             int udpTimeoutSeconds = DefaultUdpTimeoutSeconds;
             bool skipIpCheck = false;
@@ -694,7 +796,15 @@ internal static class Program
                 switch (args[i])
                 {
                     case "--test-url" when i + 1 < args.Length:
-                        testUrl = args[++i];
+                        // Retained name for backward compatibility, but this
+                        // now sets the PRIMARY hostname-addressed gate target -
+                        // pass a real hostname URL here, not an IP literal (use
+                        // --ip-literal-diagnostic-url for the non-gating
+                        // low-level TCP diagnostic instead).
+                        hostnameTestUrl = args[++i];
+                        break;
+                    case "--ip-literal-diagnostic-url" when i + 1 < args.Length:
+                        ipLiteralDiagnosticUrl = args[++i];
                         break;
                     case "--timeout-seconds" when i + 1 < args.Length && int.TryParse(args[i + 1], out var t):
                         timeoutSeconds = t;
@@ -733,7 +843,8 @@ internal static class Program
 
             return new DiagnosticOptions
             {
-                TestUrl = testUrl,
+                HostnameTestUrl = hostnameTestUrl,
+                IpLiteralDiagnosticUrl = ipLiteralDiagnosticUrl,
                 TimeoutSeconds = timeoutSeconds,
                 UdpTimeoutSeconds = udpTimeoutSeconds,
                 SkipIpCheck = skipIpCheck,
@@ -747,7 +858,8 @@ internal static class Program
         private static void PrintUsage()
         {
             Console.WriteLine("Usage: ResidentialConnect.RoutingDiagnostic.exe [options]");
-            Console.WriteLine("  --test-url <url>            HTTPS URL to request through Whole Computer routing (default: https://1.1.1.1)");
+            Console.WriteLine("  --test-url <url>            PRIMARY hostname-addressed HTTPS URL for the Whole Computer success gate (default: https://example.com/). Must be a real hostname, NOT an IP literal.");
+            Console.WriteLine("  --ip-literal-diagnostic-url <url>  IP-literal HTTPS URL for the additional, NON-GATING low-level TCP diagnostic only (default: https://1.1.1.1)");
             Console.WriteLine("  --timeout-seconds <n>       Per-request timeout in seconds for TCP/HTTP checks (default: 15)");
             Console.WriteLine("  --udp-timeout-seconds <n>   Per-probe timeout in seconds for the raw UDP/53 DNS checks (default: 5)");
             Console.WriteLine("  --skip-ip-check             Skip the api.ipify.org egress-IP-changed verification");
