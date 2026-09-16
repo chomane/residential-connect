@@ -85,6 +85,55 @@ namespace ResidentialConnect.Routing;
 /// exclusion clause - are what actually prevent loops here.
 /// </para>
 /// <para>
+/// <b>Why the RETURN filter does NOT exclude impostor packets either
+/// (2026-09-16 fix):</b> after the forward-filter fix above shipped and was
+/// confirmed working on real Windows hardware (the 3-way handshake now
+/// completes, <c>TransparentForwardingProxy</c> accepts the connection, and
+/// the upstream HTTP CONNECT succeeds), a NEW real-Windows diagnostic run
+/// isolated the next blocker: for the target flow, the client's TLS
+/// ClientHello (a genuine, established-flow DATA segment - flags
+/// <c>ACK,PSH</c>, 673-byte payload) was captured on the FORWARD leg with
+/// <c>Impostor=True</c> and reflected into the relay successfully, but the
+/// RETURN leg never captured the relay's own ACK for that data at all - only
+/// the earlier <c>SYN,ACK</c> was ever seen on RETURN. The client then
+/// retransmitted the identical ClientHello segment repeatedly (classic
+/// "my data was never ACKed" TCP behavior), and the upstream tunnel was torn
+/// down with an <c>IOException</c> ("An existing connection was forcibly
+/// closed by the remote host") and zero bytes ever relayed in either
+/// direction. This is the exact same root cause as the forward leg, one hop
+/// later: the relay's own ACK for a flow whose SYN-ACK was itself reflected
+/// is, per WinDivert's documented flow-provenance Impostor semantics (see
+/// the forward-filter remarks above), ALSO tagged <c>Impostor=True</c> - and
+/// <c>!impostor</c> on this RETURN filter was silently discarding it, so the
+/// client never received an ACK for its ClientHello and the relay's TCP
+/// stack itself eventually reset the connection when writes to a peer that
+/// stopped acknowledging kept failing. An independent, isolated single-handle
+/// "streamdump parity" test (see <c>tools/ResidentialConnect.StreamdumpParity</c>,
+/// extended 2026-09-16 to verify bidirectional established-flow DATA, not
+/// just the handshake) already proved WinDivert reflection itself correctly
+/// carries data in BOTH directions - ruling out a fundamental
+/// reflection/checksum/ABI problem and pointing squarely at this filter's own
+/// <c>!impostor</c> clause as the cause.
+/// </para>
+/// <para>
+/// <b>Why removing the impostor exclusion here ALSO does not reopen a loop:</b>
+/// exactly the same three mechanisms already relied on for the forward leg
+/// apply here, unchanged: (a) this filter still requires <c>outbound</c> -
+/// every packet this router itself reflects and re-sends is explicitly
+/// marked Inbound before re-injection (<see cref="WinDivertNative.MarkInbound"/>),
+/// so this router's own reflected/re-injected packets can never match this
+/// filter's <c>outbound</c> clause a second time, regardless of their
+/// impostor flag; (b) this filter still requires
+/// <c>tcp.SrcPort == relayPort</c> - only the local relay's own traffic can
+/// ever match it at all; (c) <see cref="PacketRedirectPlanner.PlanReturn"/>'s
+/// own flow-table gate still fail-closed drops any captured packet whose
+/// destination port is not an already-tracked flow in
+/// <see cref="RedirectFlowTable"/>. Removing <c>!impostor</c> here only
+/// allows through genuine, new, real Outbound packets from the relay's own
+/// TCP stack on its own listening port - exactly the packets this filter
+/// exists to capture in the first place.
+/// </para>
+/// <para>
 /// The forward filter ALSO excludes any packet whose SOURCE port is the
 /// local relay's own listening port (<c>tcp.SrcPort != relayPort</c>). This
 /// is required by the packet-reflection redirect technique (see
@@ -169,7 +218,13 @@ public static class BypassFilterBuilder
     /// <summary>
     /// Builds the filter for the RETURN capture handle: the local relay's
     /// own reply traffic (source port = <paramref name="relayPort"/>) on its
-    /// way back out to the redirected application.
+    /// way back out to the redirected application. Deliberately does NOT
+    /// exclude <c>impostor</c> packets - see class remarks "Why the RETURN
+    /// filter does NOT exclude impostor packets either (2026-09-16 fix)" for
+    /// the real-Windows evidence that the relay's own ACK for the client's
+    /// established-flow DATA (e.g. its TLS ClientHello) is itself flagged
+    /// Impostor, for exactly the same flow-provenance reason the forward
+    /// leg's completing ACK was.
     /// </summary>
     /// <remarks>
     /// Unlike an earlier revision of this router, this filter deliberately
@@ -192,7 +247,7 @@ public static class BypassFilterBuilder
             throw new ArgumentOutOfRangeException(nameof(relayPort), relayPort, "Relay port must be between 1 and 65535.");
         }
 
-        return $"outbound and !impostor and tcp and tcp.SrcPort == {relayPort.ToString(CultureInfo.InvariantCulture)}";
+        return $"outbound and tcp and tcp.SrcPort == {relayPort.ToString(CultureInfo.InvariantCulture)}";
     }
 
     /// <summary>

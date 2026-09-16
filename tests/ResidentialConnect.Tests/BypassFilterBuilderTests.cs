@@ -133,6 +133,39 @@ public class BypassFilterBuilderTests
     }
 
     [Fact]
+    public void BuildReturnFilter_ExcludesImpostorNoLonger_ToAvoidDroppingTheRelaysAckForEstablishedFlowData()
+    {
+        // 2026-09-16 fix: a real-Windows production diagnostic run showed
+        // the client's TLS ClientHello (ACK,PSH, 673-byte payload) was
+        // captured and reflected correctly on the FORWARD leg with
+        // Impostor=True, but the RETURN leg never captured the relay's own
+        // ACK for that data at all (only the earlier SYN,ACK was ever seen
+        // on RETURN) - the client then retransmitted the identical
+        // ClientHello segment repeatedly, and the upstream tunnel was torn
+        // down with zero bytes ever relayed in either direction. This is
+        // the same WinDivert flow-provenance Impostor semantics already
+        // fixed on the forward filter (see BuildForwardFilter's own fix and
+        // class remarks): the relay's ACK for a flow whose SYN-ACK was
+        // itself reflected is ALSO tagged Impostor=True, so "!impostor" on
+        // this RETURN filter was silently discarding it. An independent,
+        // isolated single-handle streamdump-parity test (extended to verify
+        // bidirectional established-flow DATA) already proved basic
+        // WinDivert reflection itself carries data correctly in both
+        // directions, ruling out a fundamental reflection/checksum/ABI
+        // problem and pointing squarely at this filter's own "!impostor"
+        // clause. Loop prevention continues to rely on this filter's
+        // "outbound" requirement (reflected packets are marked Inbound
+        // before re-injection) plus "tcp.SrcPort == relayPort" plus
+        // PacketRedirectPlanner.PlanReturn's own flow-table gate - not a
+        // blanket impostor exclusion.
+        var filter = BypassFilterBuilder.BuildReturnFilter(54321);
+
+        Assert.DoesNotContain("!impostor", filter);
+        Assert.Contains("outbound", filter);
+        Assert.Contains("tcp.SrcPort == 54321", filter);
+    }
+
+    [Fact]
     public void BuildDnsFilter_MatchesPlainUdp53_ExcludesLoopbackAndImpostor()
     {
         var filter = BypassFilterBuilder.BuildDnsFilter();

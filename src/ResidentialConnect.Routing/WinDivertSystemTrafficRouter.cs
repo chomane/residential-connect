@@ -39,12 +39,18 @@ namespace ResidentialConnect.Routing;
 ///   user mode. This alone is V0.2's entire DNS leak protection.</item>
 ///   <item>A <b>forward handle</b> capturing real, non-loopback outbound TCP
 ///   traffic (<see cref="BypassFilterBuilder.BuildForwardFilter"/>), excluding
-///   our own re-injected packets (<c>!impostor</c>), traffic to the upstream
-///   proxy itself, and the local relay's own reply traffic (see that method's
-///   remarks for why the last exclusion is required).</item>
+///   traffic to the upstream proxy itself and the local relay's own reply
+///   traffic (see that method's remarks for why the latter exclusion is
+///   required). Deliberately does <b>NOT</b> exclude <c>impostor</c> packets
+///   - see <see cref="BypassFilterBuilder"/> class remarks for the
+///   2026-09-15 real-Windows evidence that doing so silently discarded the
+///   client's own handshake-completing ACK.</item>
 ///   <item>A <b>return handle</b> capturing the local transparent relay's
 ///   own reply traffic back toward the redirected application
-///   (<see cref="BypassFilterBuilder.BuildReturnFilter"/>).</item>
+///   (<see cref="BypassFilterBuilder.BuildReturnFilter"/>). As of a
+///   2026-09-16 fix, this ALSO deliberately does not exclude <c>impostor</c>
+///   packets, for the same reason one hop later - see
+///   <see cref="BypassFilterBuilder"/> class remarks.</item>
 ///   </list>
 /// </item>
 /// <item>
@@ -64,17 +70,28 @@ namespace ResidentialConnect.Routing;
 /// implemented.
 /// </item>
 /// </list>
-/// <para><b>Loop prevention:</b> three independent mechanisms combine to make
-/// re-interception impossible: (a) every packet WinDivert itself re-injects
-/// is automatically tagged <c>impostor</c>, and both the forward and DNS
-/// filters explicitly exclude impostor packets; (b) reflected packets are
-/// marked <c>Inbound</c>, so they no longer match either filter's
-/// <c>outbound</c> clause even before the impostor tag is considered; (c) the
-/// forward filter also excludes any packet addressed to the upstream proxy's
-/// own host:port and any packet SOURCED from the local relay's own listening
-/// port (<see cref="BypassFilterBuilder"/> remarks) - together satisfying
-/// "Residential Connect's own upstream proxy connection must bypass its own
-/// interception path".</para>
+/// <para><b>Loop prevention:</b> as of the 2026-09-15/16 fixes, NEITHER the
+/// forward nor the return filter excludes <c>impostor</c> packets any more
+/// (only the DNS-block filter still does) - see
+/// <see cref="BypassFilterBuilder"/> class remarks for the real-Windows
+/// evidence that WinDivert's Impostor flag is a flow-provenance marker, not
+/// a "this exact packet was re-sent unchanged" marker, and that excluding it
+/// on either leg silently discarded genuine established-flow packets
+/// (the client's handshake-completing ACK on the forward leg; the relay's
+/// own ACK for established-flow DATA on the return leg). Loop prevention
+/// instead relies on three OTHER independent mechanisms: (a) every packet
+/// this router itself reflects and re-sends is explicitly marked
+/// <c>Inbound</c> before re-injection, so it can never again match either
+/// filter's mandatory <c>outbound</c> clause, regardless of its impostor
+/// flag; (b) the forward filter also excludes any packet addressed to the
+/// upstream proxy's own host:port and any packet SOURCED from the local
+/// relay's own listening port, and the return filter requires
+/// <c>tcp.SrcPort == relayPort</c> (<see cref="BypassFilterBuilder"/>
+/// remarks) - together satisfying "Residential Connect's own upstream proxy
+/// connection must bypass its own interception path"; (c)
+/// <see cref="PacketRedirectPlanner"/>'s own flow-table gate fail-closed
+/// drops any packet that is not either a brand-new SYN or part of an
+/// already-tracked flow.</para>
 /// <para><b>Fail-closed:</b> <see cref="ITransparentForwardingProxy.Faulted"/>
 /// drives an immediate transition to <see cref="SystemRoutingStatus.FailedClosed"/>;
 /// while in that state (and at every other point where a captured packet does
