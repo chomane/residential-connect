@@ -37,7 +37,7 @@ namespace ResidentialConnect.RoutingDiagnostic;
 /// <b>2026-09-16 additions (strictly additive - no existing TCP step below
 /// was modified):</b> the original TCP acceptance test only ever proved the
 /// TCP forward/return reflection pipeline. It did not prove anything about
-/// this branch's separate UDP leak-protection work (the DNS-block handle,
+/// this branch's separate UDP leak-protection work (the DNS-capture handle,
 /// or the newer general UDP-block handle - see
 /// <see cref="ResidentialConnect.Routing.BypassFilterBuilder.BuildDnsFilter"/>
 /// and <see cref="ResidentialConnect.Routing.BypassFilterBuilder.BuildUdpBlockFilter"/>).
@@ -48,11 +48,11 @@ namespace ResidentialConnect.RoutingDiagnostic;
 /// <item><b>Before</b> routing starts: a raw UDP/53 DNS query to a public
 /// resolver must succeed - this proves both that the probe itself works
 /// AND that plain UDP genuinely functions on this machine/network before
-/// any interception exists (a necessary precondition for the "blocked
-/// while Active" check below to mean anything).</item>
-/// <item><b>While Active:</b> the identical raw UDP/53 query must now
-/// receive NO response (timeout) - proving the DNS-block handle actually
-/// prevents a real DNS leak, not just that its filter string looks right.</item>
+/// any interception exists (kept as useful pre-routing evidence; see the
+/// 2026-09-16 THIRD correction below for why it no longer gates the
+/// "while Active" DNS check's validity).</item>
+/// <item><b>While Active:</b> (see the 2026-09-16 THIRD correction below -
+/// this row is intentionally NOT "must time out" any more.)</item>
 /// <item><b>While Active:</b> an HTTP/3-exact request (UDP/443, QUIC) must
 /// either fail/time out (proving the general UDP-block handle also stops
 /// non-DNS UDP from leaking) or - if <see cref="QuicConnection.IsSupported"/>
@@ -68,6 +68,70 @@ namespace ResidentialConnect.RoutingDiagnostic;
 /// unchanged in behavior and wording - only their surrounding step numbers
 /// shifted to make room for the new UDP/DNS/QUIC steps interleaved at the
 /// correct points in the sequence (before start / while Active / after stop).
+/// </para>
+/// <para>
+/// <b>2026-09-16 THIRD correction (this file ONLY, DIAGNOSTIC-ONLY - no
+/// production behavior changed):</b> a real Windows run exposed that the
+/// "while Active" UDP/53 check above was testing an OBSOLETE assumption.
+/// The production architecture does not simply DROP outbound UDP/53 - it
+/// CAPTURES the query, resolves it via proxied DNS-over-HTTPS, and
+/// synthesizes a valid reply that appears to come from the originally
+/// addressed DNS server (see
+/// <see cref="ResidentialConnect.Routing.BypassFilterBuilder.BuildDnsFilter"/>,
+/// <see cref="ResidentialConnect.Routing.WinDivertSystemTrafficRouter"/>'s
+/// DNS capture loop, and <see cref="ResidentialConnect.Routing.DnsUdpReplyPacketBuilder"/>).
+/// The real Windows run's own diagnostics log line
+/// (<c>[DNS #9] 192.168.0.108:51313 -&gt; 1.1.1.1:53 answered via proxied DoH
+/// (61 byte response)</c>) proved this exact behavior, immediately followed
+/// by the old Step 4b incorrectly reporting that same VALID synthesized
+/// response as a direct UDP/53 leak - the old check was logically incapable
+/// of telling a correct synthesized answer apart from a real direct one,
+/// because both look identical from the querying socket's point of view
+/// when the destination is a REAL resolver (1.1.1.1) that could
+/// legitimately have answered directly too.
+/// </para>
+/// <para>
+/// The fix: Step 4b now targets a documentation-only IANA TEST-NET-1
+/// address (<c>192.0.2.1</c>, RFC 5737 - see
+/// <see cref="DefaultDnsInterceptionTestNetIp"/>) instead of a real public
+/// resolver. <c>192.0.2.1</c> cannot legitimately run any real DNS service
+/// at all, so a VALID, transaction-ID-matching DNS reply to a query sent
+/// there can ONLY have come from this app's own DNS-capture-and-synthesize
+/// path - it is now unambiguous proof of interception, not a leak. The
+/// renamed result is <c>DNS-PROXIED-WHILE-ACTIVE</c> (PASS = a valid
+/// synthesized reply WAS received; FAIL = no valid reply, meaning the
+/// production DNS-capture path did not intercept and answer the query).
+/// The pre-routing real-resolver baseline (Step 1b, still targeting
+/// 1.1.1.1 by default) is UNCHANGED and kept purely as evidence this
+/// specific Windows/network environment had genuinely working direct
+/// UDP/53 before routing started - it is no longer treated as a
+/// precondition for Step 4b's validity, since Step 4b's new TEST-NET
+/// target is unambiguous on its own regardless of whether real UDP/53
+/// happens to work on this network.
+/// </para>
+/// <para>
+/// <b>Direct-leak observation (considered, not implemented):</b> a
+/// lower-priority WinDivert Sniff handle that watches for the ORIGINAL
+/// (unmodified) UDP/53 query continuing toward the real network after the
+/// production capture handle intercepts it was considered, per the
+/// requirement to add this "if it can be done safely ... without altering
+/// production behavior". It was deliberately NOT implemented in this
+/// diagnostic-only correction: doing so would require this diagnostic tool
+/// to open its OWN raw native WinDivert handle directly (via new P/Invoke
+/// declarations local to this file, since
+/// <see cref="ResidentialConnect.Routing.WinDivertNative"/> is internal and
+/// not exposed to this project) running concurrently, at a different
+/// priority, alongside the production router's own handles on the same
+/// real Windows machine - new, untested native interop with real
+/// priority/ordering semantics that have not been verified safe, which is
+/// a meaningfully higher-risk addition than "the minimum correction" this
+/// turn calls for. The TEST-NET synthetic-response check above is
+/// sufficient on its own (a real resolver cannot exist at 192.0.2.1, so a
+/// valid reply is unambiguous proof of interception) and is the only
+/// change made this turn, per the explicit fallback instruction: "If
+/// implementing that monitor would require risky production changes, do
+/// NOT change production code. The TEST-NET synthetic-response check is
+/// the minimum correction."
 /// </para>
 /// <para>
 /// <b>2026-09-16 second correction (this file ONLY - acceptance-test-only,
@@ -105,6 +169,19 @@ internal static class Program
     private const string IpEchoUrl = "https://api.ipify.org";
     private const string DefaultDnsProbeServerIp = "1.1.1.1";
     private const string DefaultDnsProbeHostName = "example.com";
+    // 2026-09-16 THIRD correction: 192.0.2.1 is TEST-NET-1 (RFC 5737) - an
+    // IANA-reserved documentation-only IPv4 address that can NEVER
+    // legitimately run a real Internet DNS service. Sending the "while
+    // Active" DNS probe here (instead of to a real resolver like 1.1.1.1)
+    // makes a VALID, transaction-ID-matching reply unambiguous proof that
+    // ResidentialConnect's own DNS-capture-and-synthesize path answered it
+    // (see BypassFilterBuilder.BuildDnsFilter / WinDivertSystemTrafficRouter's
+    // DNS capture loop / DnsUdpReplyPacketBuilder) - no real DNS server
+    // could possibly have answered from this address, so there is no way
+    // to confuse a correct synthesized answer with a real direct one, which
+    // was exactly the flaw a real Windows run exposed in the old
+    // real-resolver-based "must time out" check this replaces.
+    private const string DefaultDnsInterceptionTestNetIp = "192.0.2.1";
     private const string DefaultQuicTestUrl = "https://cloudflare-quic.com/";
     // 2026-09-16 correction: the previous overall PASS text claimed public
     // IPv6 leaks were blocked, but AcceptanceSummary.AllRequiredChecksPassed()
@@ -140,8 +217,12 @@ internal static class Program
         Console.WriteLine("(see docs/CHECKPOINTS.md) - that mistake is not repeated here: an IP-literal");
         Console.WriteLine("request (Step 3b) is kept ONLY as an informational, non-gating diagnostic.");
         Console.WriteLine("Also includes the 2026-09-16 UDP/DNS leak-protection checks: a raw UDP/53");
-        Console.WriteLine("DNS probe before/while/after routing, and an HTTP/3 (UDP/443 QUIC) probe");
-        Console.WriteLine("while routing is Active. Also includes a real IPv6 leak test (raw TCP");
+        Console.WriteLine("baseline before routing, a DNS-INTERCEPTION check while Active (sends the");
+        Console.WriteLine("query to an IANA TEST-NET-1 address - 192.0.2.1 - where only this app's own");
+        Console.WriteLine("DNS-capture-and-proxied-DoH path could possibly answer; see");
+        Console.WriteLine("DNS-PROXIED-WHILE-ACTIVE below), a UDP/53 restored-after-disconnect check,");
+        Console.WriteLine("and an HTTP/3 (UDP/443 QUIC) probe while routing is Active. Also includes a");
+        Console.WriteLine("real IPv6 leak test (raw TCP");
         Console.WriteLine("connect to a public IPv6 LITERAL, no DNS) - IPV6-BASELINE / IPV6-BLOCKED-");
         Console.WriteLine("WHILE-ACTIVE / IPV6-RESTORED-AFTER-DISCONNECT - which is reported as a");
         Console.WriteLine("genuine capability [SKIP] (never a false PASS) if this machine has no");
@@ -423,20 +504,34 @@ internal static class Program
                 summary.ProxyEgressMatch = false;
             }
 
-            // ---- NEW Step 4b: UDP/53 DNS must now be BLOCKED (fail-closed) ----
+            // ---- NEW Step 4b (2026-09-16 THIRD correction): DNS must now ----
+            // ---- be INTERCEPTED AND ANSWERED via proxied DoH, NOT simply ----
+            // ---- "blocked"/timed out - see the class-level remarks above ----
+            // ---- for the full rationale (a real Windows run proved the   ----
+            // ---- old "must time out" assumption obsolete and produced a  ----
+            // ---- false-failure misreading a VALID synthesized DNS reply  ----
+            // ---- from BuildDnsFilter's own capture-and-answer path as a  ----
+            // ---- direct leak). Targets DefaultDnsInterceptionTestNetIp   ----
+            // ---- (192.0.2.1, RFC 5737 TEST-NET-1) instead of a real      ----
+            // ---- resolver - a valid, transaction-ID-matching reply from  ----
+            // ---- that address can ONLY have come from this app's own DNS ----
+            // ---- capture-and-synthesize path, never from a real server. ----
             Console.WriteLine();
-            Console.WriteLine($"--- Step 4b: repeating the raw UDP/53 DNS probe to {options.DnsProbeServerIp} WHILE Active ---");
-            Console.WriteLine("    (PASS here means NO response was received at all - proving the DNS-block");
-            Console.WriteLine("     WinDivert Drop handle is actually preventing this UDP/53 query from ever");
-            Console.WriteLine("     leaving the machine, not just that BuildDnsFilter's filter string looks");
-            Console.WriteLine("     correct in isolation.)");
-            var udpWhileActive = await TryRawUdpDnsQueryAsync(options.DnsProbeServerIp, options.DnsProbeHostName, options.UdpTimeoutSeconds, timeoutCts.Token);
-            var udpBlocked = !udpWhileActive.Responded;
-            WriteResult("UDP-DNS-BLOCKED-WHILE-ACTIVE", ToOutcome(udpBlocked),
-                udpBlocked
-                    ? udpWhileActive.Detail
-                    : $"LEAK: {udpWhileActive.Detail} - plain UDP/53 DNS reached the real network directly while Whole Computer mode reported Active. This is a fail-closed violation in the DNS-block handle (see BypassFilterBuilder.BuildDnsFilter / DnsLeakGuard).");
-            summary.UdpDns53BlockedWhileActive = udpBlocked;
+            Console.WriteLine($"--- Step 4b: sending the same raw DNS query to {options.DnsInterceptionTestNetIp}:53 (IANA TEST-NET-1 - no real DNS service can exist here) WHILE Active ---");
+            Console.WriteLine("    (PASS here means a VALID, transaction-ID-matching DNS reply WAS received -");
+            Console.WriteLine("     since 192.0.2.1 cannot legitimately run any real Internet DNS service,");
+            Console.WriteLine("     the ONLY possible source of a valid reply is ResidentialConnect's own");
+            Console.WriteLine("     DNS-capture handle (BuildDnsFilter) intercepting this UDP/53 query and");
+            Console.WriteLine("     answering it via proxied DNS-over-HTTPS (see WinDivertSystemTrafficRouter's");
+            Console.WriteLine("     DNS capture loop / DnsUdpReplyPacketBuilder) - this is now unambiguous");
+            Console.WriteLine("     proof of interception, never a leak, regardless of what a real resolver");
+            Console.WriteLine("     might have done at a different destination address.)");
+            var dnsInterceptionResult = await TryRawUdpDnsQueryAsync(options.DnsInterceptionTestNetIp, options.DnsProbeHostName, options.UdpTimeoutSeconds, timeoutCts.Token);
+            WriteResult("DNS-PROXIED-WHILE-ACTIVE", ToOutcome(dnsInterceptionResult.Responded),
+                dnsInterceptionResult.Responded
+                    ? $"[PASS] DNS intercepted and answered through proxied DoH while Active - {dnsInterceptionResult.Detail} (this reply could only have come from ResidentialConnect's own DNS-capture-and-synthesize path, since {options.DnsInterceptionTestNetIp} is an IANA TEST-NET-1 address with no real DNS service)."
+                    : $"FAIL: {dnsInterceptionResult.Detail} - no valid DNS reply was received for a query sent to the TEST-NET address while Whole Computer mode reported Active. This means the production DNS-capture handle (BypassFilterBuilder.BuildDnsFilter) did NOT intercept and answer this UDP/53 query as expected - the application's own DNS resolution would time out/fail in this state.");
+            summary.DnsProxiedWhileActive = dnsInterceptionResult.Responded;
 
             // ---- NEW Step 4c: general UDP/QUIC (HTTP/3) must be BLOCKED, or SKIP if unavailable ----
             Console.WriteLine();
@@ -541,9 +636,14 @@ internal static class Program
         // check was capability-SKIPPED (no public IPv6 on this machine),
         // the wording below says so explicitly instead of making an
         // unsupported claim about IPv6.
+        // 2026-09-16 THIRD correction: DNS is no longer described as
+        // "blocked" - the production architecture INTERCEPTS AND ANSWERS
+        // UDP/53 DNS via proxied DoH rather than dropping it (see
+        // DNS-PROXIED-WHILE-ACTIVE above). Only the general UDP/QUIC
+        // handle is still accurately described as "blocked".
         string overallPassText = summary.Ipv6WasLiveTested
-            ? "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, blocked UDP/public-IPv6 leaks (IPv6 was LIVE-tested end to end on this machine), and cleaned up correctly. ==="
-            : "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, blocked UDP leaks, and cleaned up correctly. NOTE: the public IPv6 leak test was capability-SKIPPED (see IPV6-BASELINE above) - this machine has no usable public IPv6 path at all, so IPv6 leak-blocking was NOT live-tested this run and this PASS makes no claim about it either way. ===";
+            ? "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, intercepted and proxied DNS via DoH, blocked general UDP/QUIC and public-IPv6 leaks (IPv6 was LIVE-tested end to end on this machine), and cleaned up correctly. ==="
+            : "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, intercepted and proxied DNS via DoH, and blocked general UDP/QUIC leaks, and cleaned up correctly. NOTE: the public IPv6 leak test was capability-SKIPPED (see IPV6-BASELINE above) - this machine has no usable public IPv6 path at all, so IPv6 leak-blocking was NOT live-tested this run and this PASS makes no claim about it either way. ===";
         Console.WriteLine();
         Console.WriteLine(allPassed
             ? overallPassText
@@ -849,13 +949,22 @@ internal static class Program
         Console.WriteLine("=== ACCEPTANCE SUMMARY ===");
         WriteSummaryLine("HOSTNAME-HTTPS-ACTIVE (real hostname DNS+HTTPS routed through proxy)", ToOutcome(summary.HostnameHttpsActive));
         WriteSummaryLine("PROXY-EGRESS-MATCH (observed egress IP == proxy's established exit IP)", ToOutcome(summary.ProxyEgressMatch));
-        WriteSummaryLine("UDP/53 (DNS) direct-leak blocked while Active", ToOutcome(summary.UdpDns53BlockedWhileActive));
+        // 2026-09-16 THIRD correction: renamed from "UDP/53 (DNS) direct-leak
+        // blocked while Active" - the production architecture intercepts and
+        // ANSWERS DNS via proxied DoH, it does not merely block/time out UDP/53,
+        // so "blocked" was never an accurate description of success here (see
+        // the class-level remarks for the real Windows run that exposed this).
+        WriteSummaryLine("DNS-PROXIED-WHILE-ACTIVE (TEST-NET-1 query intercepted and answered via proxied DoH)", ToOutcome(summary.DnsProxiedWhileActive));
         WriteSummaryLine("General UDP/QUIC (public UDP) bypass blocked while Active", summary.UdpQuicOutcome);
         WriteSummaryLine("Hostname DNS/HTTPS restored after disconnect", ToOutcome(summary.HostnameHttpsRestoredAfterDisconnect));
         WriteSummaryLine("UDP restored after disconnect", ToOutcome(summary.UdpDnsRestoredAfterDisconnect));
         if (!summary.UdpDnsBaselineWorked)
         {
-            Console.WriteLine("    NOTE: the pre-routing raw UDP/53 baseline itself failed - the 'UDP/53 direct-leak blocked while Active' result above is NOT reliable evidence of this app's leak protection (see Step 1b).");
+            Console.WriteLine("    NOTE: the pre-routing raw UDP/53 baseline (to a REAL resolver, Step 1b) itself failed - this indicates a pre-existing network/firewall problem unrelated to Whole Computer mode. It no longer affects the reliability of DNS-PROXIED-WHILE-ACTIVE above (that check targets an IANA TEST-NET-1 address that is unambiguous on its own), but is still useful evidence about this specific Windows/network environment.");
+        }
+        if (!summary.DnsProxiedWhileActive)
+        {
+            Console.WriteLine("    NOTE: no valid DNS reply was received from the TEST-NET-1 probe while Active - the production DNS-capture-and-synthesize path (BypassFilterBuilder.BuildDnsFilter) did not intercept/answer this query as expected (see Step 4b).");
         }
 
         // 2026-09-16 second correction: the IPv6 result MUST appear in this
@@ -905,16 +1014,17 @@ internal static class Program
 
     /// <summary>
     /// Tracks the independent results the acceptance test's final summary
-    /// banner must report, plus the pre-routing UDP baseline used only to
-    /// qualify (not gate) the "blocked while Active" result. 2026-09-16
-    /// correction: HostnameHttpsActive/ProxyEgressMatch/
-    /// HostnameHttpsRestoredAfterDisconnect replace the previous
-    /// IP-literal-based TcpRoutedThroughProxy/ProxyEgressVerified/
-    /// TcpRestoredAfterDisconnect fields as the PRIMARY, gating results - a
-    /// hostname failure or an egress-IP mismatch is always a real FAIL,
-    /// never SKIP.
+    /// banner must report, plus the pre-routing UDP baseline kept as
+    /// evidence only (see the 2026-09-16 THIRD correction remarks below for
+    /// why it no longer gates anything). 2026-09-16 correction:
+    /// HostnameHttpsActive/ProxyEgressMatch/HostnameHttpsRestoredAfterDisconnect
+    /// replace the previous IP-literal-based TcpRoutedThroughProxy/
+    /// ProxyEgressVerified/TcpRestoredAfterDisconnect fields as the PRIMARY,
+    /// gating results - a hostname failure or an egress-IP mismatch is
+    /// always a real FAIL, never SKIP.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// 2026-09-16 second correction: adds the IPv6 leak-test triple
     /// (Ipv6BaselineWorked / Ipv6BlockedWhileActive / Ipv6RestoredAfterDisconnect).
     /// The overall PASS text previously claimed public IPv6 leaks were
@@ -925,13 +1035,30 @@ internal static class Program
     /// "capability SKIP - Ipv6BaselineWorked was false, so there was nothing
     /// to leak on and these two checks were never meaningfully attempted",
     /// which must never be conflated with either a true PASS or a false FAIL.
+    /// </para>
+    /// <para>
+    /// 2026-09-16 THIRD correction: <c>UdpDns53BlockedWhileActive</c> is
+    /// renamed to <see cref="DnsProxiedWhileActive"/> - the production
+    /// architecture intercepts and ANSWERS UDP/53 DNS via proxied DoH
+    /// rather than dropping it, so "blocked" was never an accurate
+    /// description of the expected PASS state, and a real Windows run
+    /// proved the old name/semantics produced a false FAIL on a genuinely
+    /// correct synthesized DNS reply. <c>UdpDnsBaselineWorked</c> (Step 1b,
+    /// still against a real resolver) is retained on this class purely as
+    /// informational evidence about this specific environment's raw UDP/53
+    /// connectivity - it is intentionally EXCLUDED from
+    /// <see cref="AllRequiredChecksPassed"/> for the same reason it was
+    /// removed from gating: <see cref="DnsProxiedWhileActive"/>'s TEST-NET-1
+    /// target is unambiguous on its own and does not need this baseline to
+    /// be trustworthy.
+    /// </para>
     /// </remarks>
     private sealed class AcceptanceSummary
     {
         public bool UdpDnsBaselineWorked { get; set; }
         public bool HostnameHttpsActive { get; set; }
         public bool ProxyEgressMatch { get; set; }
-        public bool UdpDns53BlockedWhileActive { get; set; }
+        public bool DnsProxiedWhileActive { get; set; }
         public CheckOutcome UdpQuicOutcome { get; set; } = CheckOutcome.Fail;
         public bool UdpDnsRestoredAfterDisconnect { get; set; }
         public bool HostnameHttpsRestoredAfterDisconnect { get; set; }
@@ -963,12 +1090,18 @@ internal static class Program
         /// exactly <c>true</c> (not merely non-false) for overall PASS - a
         /// direct IPv6 leak while Active, OR IPv6 failing to return after
         /// disconnect, is always a hard FAIL once baseline IPv6 was proven
-        /// to exist.
+        /// to exist. 2026-09-16 THIRD correction:
+        /// <see cref="DnsProxiedWhileActive"/> replaces
+        /// <c>UdpDns53BlockedWhileActive</c> here - it must be exactly
+        /// <c>true</c> (a valid synthesized reply WAS received from the
+        /// TEST-NET-1 probe) for overall PASS, since that is now the
+        /// correct evidence of the production DNS-capture-and-answer path
+        /// working, not "no response at all".
         /// </remarks>
         public bool AllRequiredChecksPassed() =>
             HostnameHttpsActive
             && ProxyEgressMatch
-            && UdpDns53BlockedWhileActive
+            && DnsProxiedWhileActive
             && UdpQuicOutcome != CheckOutcome.Fail
             && UdpDnsRestoredAfterDisconnect
             && HostnameHttpsRestoredAfterDisconnect
@@ -1015,6 +1148,7 @@ internal static class Program
         public Guid? ProfileId { get; private init; }
         public string DnsProbeServerIp { get; private init; } = DefaultDnsProbeServerIp;
         public string DnsProbeHostName { get; private init; } = DefaultDnsProbeHostName;
+        public string DnsInterceptionTestNetIp { get; private init; } = DefaultDnsInterceptionTestNetIp;
         public string QuicTestUrl { get; private init; } = DefaultQuicTestUrl;
         public string Ipv6ProbeLiteral { get; private init; } = DefaultIpv6ProbeLiteral;
         public int Ipv6ProbePort { get; private init; } = DefaultIpv6ProbePort;
@@ -1029,6 +1163,7 @@ internal static class Program
             Guid? profileId = null;
             string dnsProbeServerIp = DefaultDnsProbeServerIp;
             string dnsProbeHostName = DefaultDnsProbeHostName;
+            string dnsInterceptionTestNetIp = DefaultDnsInterceptionTestNetIp;
             string quicTestUrl = DefaultQuicTestUrl;
             string ipv6ProbeLiteral = DefaultIpv6ProbeLiteral;
             int ipv6ProbePort = DefaultIpv6ProbePort;
@@ -1069,6 +1204,9 @@ internal static class Program
                     case "--dns-test-host" when i + 1 < args.Length:
                         dnsProbeHostName = args[++i];
                         break;
+                    case "--dns-interception-testnet-ip" when i + 1 < args.Length:
+                        dnsInterceptionTestNetIp = args[++i];
+                        break;
                     case "--quic-test-url" when i + 1 < args.Length:
                         quicTestUrl = args[++i];
                         break;
@@ -1100,6 +1238,7 @@ internal static class Program
                 ProfileId = profileId,
                 DnsProbeServerIp = dnsProbeServerIp,
                 DnsProbeHostName = dnsProbeHostName,
+                DnsInterceptionTestNetIp = dnsInterceptionTestNetIp,
                 QuicTestUrl = quicTestUrl,
                 Ipv6ProbeLiteral = ipv6ProbeLiteral,
                 Ipv6ProbePort = ipv6ProbePort
@@ -1117,6 +1256,7 @@ internal static class Program
             Console.WriteLine("  --profile-id <guid>         Use a specific saved proxy profile id instead of the currently selected/first one");
             Console.WriteLine("  --dns-test-ip <ip>          Public DNS resolver IP for the raw UDP/53 probe (default: 1.1.1.1)");
             Console.WriteLine("  --dns-test-host <name>      Hostname to query in the raw UDP/53 probe (default: example.com)");
+            Console.WriteLine("  --dns-interception-testnet-ip <ip>  IANA TEST-NET address used for the DNS-PROXIED-WHILE-ACTIVE interception check (default: 192.0.2.1, RFC 5737 TEST-NET-1 - must be an address that cannot legitimately run a real DNS service)");
             Console.WriteLine("  --quic-test-url <url>       HTTP/3-capable HTTPS URL for the UDP/443 QUIC block check (default: https://cloudflare-quic.com/)");
             Console.WriteLine("  --ipv6-test-literal <addr>  Public IPv6 LITERAL (no DNS) used for the IPv6 leak-test baseline/while-Active/after-disconnect probes (default: 2606:4700:4700::1111)");
             Console.WriteLine("  --ipv6-test-port <n>        TCP port to connect to on the IPv6 literal above (default: 443)");
