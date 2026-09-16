@@ -69,6 +69,22 @@ namespace ResidentialConnect.RoutingDiagnostic;
 /// shifted to make room for the new UDP/DNS/QUIC steps interleaved at the
 /// correct points in the sequence (before start / while Active / after stop).
 /// </para>
+/// <para>
+/// <b>2026-09-16 second correction (this file ONLY - acceptance-test-only,
+/// no production behavior changed):</b> the overall PASS text previously
+/// claimed public IPv6 leaks were blocked, but <c>AcceptanceSummary.AllRequiredChecksPassed()</c>
+/// had no live IPv6 result feeding it at all. This adds a real, three-point
+/// IPv6 leak test - IPV6-BASELINE (before routing, raw TCP connect to a
+/// stable public IPv6 LITERAL, deliberately with NO DNS involved),
+/// IPV6-BLOCKED-WHILE-ACTIVE (must fail while Active - V0.2 intentionally
+/// fail-closes ALL public IPv6), and IPV6-RESTORED-AFTER-DISCONNECT (must
+/// succeed again after <c>StopAsync</c>). If IPV6-BASELINE itself finds no
+/// usable public IPv6 path on this machine, the whole triple is reported as
+/// a genuine, non-fatal capability SKIP - never a false PASS, and never
+/// silently treated as proof the IPv6 block works. The overall PASS banner
+/// text is now conditional: it only claims IPv6 was live-tested when the
+/// baseline actually found working public IPv6 on this machine.
+/// </para>
 /// </remarks>
 [SupportedOSPlatform("windows")]
 internal static class Program
@@ -90,6 +106,17 @@ internal static class Program
     private const string DefaultDnsProbeServerIp = "1.1.1.1";
     private const string DefaultDnsProbeHostName = "example.com";
     private const string DefaultQuicTestUrl = "https://cloudflare-quic.com/";
+    // 2026-09-16 correction: the previous overall PASS text claimed public
+    // IPv6 leaks were blocked, but AcceptanceSummary.AllRequiredChecksPassed()
+    // contained no live IPv6 result at all - this constant/probe pair fixes
+    // that gap. A stable public IPv6 LITERAL (Cloudflare's 2606:4700:4700::1111
+    // DNS-over-IPv6 service, port 443) is used deliberately instead of a
+    // hostname, per the "do not use DNS for this capability check if
+    // practical" requirement - a raw TCP SYN/connect to this literal:port
+    // proves genuine IPv6 reachability without depending on IPv6 DNS
+    // resolution (a separate concern) at all.
+    private const string DefaultIpv6ProbeLiteral = "2606:4700:4700::1111";
+    private const int DefaultIpv6ProbePort = 443;
     private const int DefaultTimeoutSeconds = 15;
     private const int DefaultUdpTimeoutSeconds = 5;
 
@@ -114,7 +141,11 @@ internal static class Program
         Console.WriteLine("request (Step 3b) is kept ONLY as an informational, non-gating diagnostic.");
         Console.WriteLine("Also includes the 2026-09-16 UDP/DNS leak-protection checks: a raw UDP/53");
         Console.WriteLine("DNS probe before/while/after routing, and an HTTP/3 (UDP/443 QUIC) probe");
-        Console.WriteLine("while routing is Active.");
+        Console.WriteLine("while routing is Active. Also includes a real IPv6 leak test (raw TCP");
+        Console.WriteLine("connect to a public IPv6 LITERAL, no DNS) - IPV6-BASELINE / IPV6-BLOCKED-");
+        Console.WriteLine("WHILE-ACTIVE / IPV6-RESTORED-AFTER-DISCONNECT - which is reported as a");
+        Console.WriteLine("genuine capability [SKIP] (never a false PASS) if this machine has no");
+        Console.WriteLine("usable public IPv6 path to test on at all.");
         Console.WriteLine();
 
         var options = DiagnosticOptions.Parse(args);
@@ -260,6 +291,32 @@ internal static class Program
             Console.WriteLine("Raw UDP/53 baseline failed BEFORE routing started - this indicates a pre-existing network/firewall problem unrelated to Whole Computer mode (or that outbound UDP/53 to this resolver is already blocked by something else). The 'UDP/53 blocked while Active' check below cannot be trusted as evidence of this app's own leak protection unless this baseline succeeds first. Fix connectivity to the DNS probe server (or pass --dns-test-ip with a reachable resolver) before re-running this diagnostic.");
         }
 
+        // ---- NEW Step 1c: public IPv6 capability baseline (routing NOT yet active) ----
+        // 2026-09-16 correction: determines, on THIS machine, whether public
+        // IPv6 connectivity even exists at all BEFORE claiming anything
+        // about whether the IPv6 fail-closed block works. Deliberately uses
+        // a raw TCP connect to an IPv6 LITERAL:port (no DNS involved) per
+        // the "do not use DNS for this capability check if practical"
+        // requirement. If this machine genuinely has no usable public IPv6
+        // path, the "blocked while Active" check below is a genuine
+        // capability SKIP, not a false PASS - there is nothing to leak on.
+        Console.WriteLine();
+        Console.WriteLine($"--- Step 1c: public IPv6 capability baseline - raw TCP connect to [{options.Ipv6ProbeLiteral}]:{options.Ipv6ProbePort} (routing NOT yet active) ---");
+        Console.WriteLine("    (Raw Socket.ConnectAsync to an IPv6 LITERAL - no DNS lookup of any kind is");
+        Console.WriteLine("     performed for this check, so it isolates \"does this machine have a working");
+        Console.WriteLine("     public IPv6 path at all\" from any DNS/hostname-resolution concern.)");
+        var ipv6Baseline = await TryIPv6ProbeAsync(options.Ipv6ProbeLiteral, options.Ipv6ProbePort, options.TimeoutSeconds, timeoutCts.Token);
+        summary.Ipv6BaselineWorked = ipv6Baseline.Connected;
+        if (ipv6Baseline.Connected)
+        {
+            WriteResult("IPV6-BASELINE", CheckOutcome.Pass, ipv6Baseline.Detail);
+        }
+        else
+        {
+            WriteResult("IPV6-BASELINE", CheckOutcome.Skip,
+                $"SKIP - {ipv6Baseline.Detail} This machine has no functioning public IPv6 path to leak on right now, so the IPv6 fail-closed block CANNOT be exercised at all (this is a genuine capability limitation of this test run, NOT evidence that the IPv6 block works - it simply cannot be tested here). IPV6-BLOCKED-WHILE-ACTIVE and IPV6-RESTORED-AFTER-DISCONNECT below will also be reported as SKIP for the same reason.");
+        }
+
         // ---- Start Whole Computer routing -------------------------------
         Console.WriteLine();
         Console.WriteLine("--- Step 2: starting Whole Computer routing ---");
@@ -392,6 +449,33 @@ internal static class Program
             var quicResult = await TryQuicBlockedCheckAsync(options.QuicTestUrl, options.TimeoutSeconds, timeoutCts.Token);
             WriteResult("UDP-QUIC-BLOCKED-WHILE-ACTIVE", quicResult.Outcome, quicResult.Detail);
             summary.UdpQuicOutcome = quicResult.Outcome;
+
+            // ---- NEW Step 4d: public IPv6 must now be BLOCKED (fail-closed), ----
+            // ---- ONLY meaningful if the Step 1c baseline actually worked --------
+            Console.WriteLine();
+            Console.WriteLine($"--- Step 4d: repeating the public IPv6 probe to [{options.Ipv6ProbeLiteral}]:{options.Ipv6ProbePort} WHILE Active ---");
+            if (!summary.Ipv6BaselineWorked)
+            {
+                WriteResult("IPV6-BLOCKED-WHILE-ACTIVE", CheckOutcome.Skip,
+                    "SKIP - the Step 1c capability baseline already established this machine has no functioning public IPv6 path (see IPV6-BASELINE above), so there is nothing to leak on and this check cannot meaningfully be run. This SKIP does NOT prove the IPv6 fail-closed block works, but it is non-fatal - there was no public IPv6 to leak in the first place.");
+                summary.Ipv6BlockedWhileActive = null;
+            }
+            else
+            {
+                Console.WriteLine("    (PASS here means the connect attempt FAILED/timed out - proving the IPv6");
+                Console.WriteLine("     fail-closed block (BypassFilterBuilder.BuildIPv6BlockFilter) actually");
+                Console.WriteLine("     prevents this public IPv6 connection from ever leaving the machine, not");
+                Console.WriteLine("     just that its filter string looks correct in isolation. If baseline IPv6");
+                Console.WriteLine("     worked (it did, per Step 1c) but this ALSO succeeds, that is a hard FAIL -");
+                Console.WriteLine("     a direct IPv6 leak.)");
+                var ipv6WhileActive = await TryIPv6ProbeAsync(options.Ipv6ProbeLiteral, options.Ipv6ProbePort, options.TimeoutSeconds, timeoutCts.Token);
+                var ipv6Blocked = !ipv6WhileActive.Connected;
+                WriteResult("IPV6-BLOCKED-WHILE-ACTIVE", ToOutcome(ipv6Blocked),
+                    ipv6Blocked
+                        ? ipv6WhileActive.Detail
+                        : $"LEAK: {ipv6WhileActive.Detail} - public IPv6 reached the real network directly while Whole Computer mode reported Active, even though Step 1c proved this machine has working public IPv6. This is a hard FAIL / direct IPv6 leak in the IPv6 fail-closed block (see BypassFilterBuilder.BuildIPv6BlockFilter).");
+                summary.Ipv6BlockedWhileActive = ipv6Blocked;
+            }
         }
         finally
         {
@@ -416,6 +500,31 @@ internal static class Program
         WriteResult("UDP-DNS-RESTORED-AFTER-DISCONNECT", ToOutcome(udpRestored.Responded), udpRestored.Detail);
         summary.UdpDnsRestoredAfterDisconnect = udpRestored.Responded;
 
+        // ---- NEW Step 5c: public IPv6 must work normally again after   ----
+        // ---- disconnect - ONLY meaningful if the Step 1c baseline       ----
+        // ---- actually worked in the first place ---------------------------
+        Console.WriteLine();
+        Console.WriteLine($"--- Step 5c: repeating the public IPv6 probe to [{options.Ipv6ProbeLiteral}]:{options.Ipv6ProbePort} AFTER disconnect ---");
+        if (!summary.Ipv6BaselineWorked)
+        {
+            WriteResult("IPV6-RESTORED-AFTER-DISCONNECT", CheckOutcome.Skip,
+                "SKIP - the Step 1c capability baseline already established this machine has no functioning public IPv6 path (see IPV6-BASELINE above), so there is nothing to confirm was 'restored'. This SKIP does not indicate any problem with StopAsync/cleanup - IPv6 simply was never available on this machine to begin with.");
+            summary.Ipv6RestoredAfterDisconnect = null;
+        }
+        else
+        {
+            Console.WriteLine("    (Baseline IPv6 worked in Step 1c, so after StopAsync this MUST succeed");
+            Console.WriteLine("     again - if it does not, cleanup left IPv6 networking broken/still");
+            Console.WriteLine("     blocked, which is a hard FAIL even though the 'blocked while Active'");
+            Console.WriteLine("     check above may have correctly passed.)");
+            var ipv6Restored = await TryIPv6ProbeAsync(options.Ipv6ProbeLiteral, options.Ipv6ProbePort, options.TimeoutSeconds, timeoutCts.Token);
+            WriteResult("IPV6-RESTORED-AFTER-DISCONNECT", ToOutcome(ipv6Restored.Connected),
+                ipv6Restored.Connected
+                    ? ipv6Restored.Detail
+                    : $"FAIL: {ipv6Restored.Detail} - public IPv6 connectivity did NOT return after StopAsync, even though Step 1c proved it worked before routing started. This is a hard FAIL - cleanup left this machine's IPv6 networking broken/still blocked.");
+            summary.Ipv6RestoredAfterDisconnect = ipv6Restored.Connected;
+        }
+
         // ---- Confirm normal HOSTNAME-addressed networking is restored ----
         Console.WriteLine();
         Console.WriteLine($"--- Step 6: confirming normal (direct) hostname-addressed HTTPS networking to {options.HostnameTestUrl} is restored after disconnect ---");
@@ -426,9 +535,18 @@ internal static class Program
         PrintAcceptanceSummary(summary);
 
         var allPassed = summary.AllRequiredChecksPassed();
+        // 2026-09-16 second correction: the PASS text must never claim
+        // public IPv6 leaks were "blocked" unless IPv6 was actually
+        // LIVE-tested end to end (summary.Ipv6WasLiveTested) - if the IPv6
+        // check was capability-SKIPPED (no public IPv6 on this machine),
+        // the wording below says so explicitly instead of making an
+        // unsupported claim about IPv6.
+        string overallPassText = summary.Ipv6WasLiveTested
+            ? "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, blocked UDP/public-IPv6 leaks (IPv6 was LIVE-tested end to end on this machine), and cleaned up correctly. ==="
+            : "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, blocked UDP leaks, and cleaned up correctly. NOTE: the public IPv6 leak test was capability-SKIPPED (see IPV6-BASELINE above) - this machine has no usable public IPv6 path at all, so IPv6 leak-blocking was NOT live-tested this run and this PASS makes no claim about it either way. ===";
         Console.WriteLine();
         Console.WriteLine(allPassed
-            ? "=== OVERALL RESULT: PASS - Whole Computer mode routed real hostname DNS+HTTPS traffic through the VERIFIED proxy egress IP, blocked UDP/public-IPv6 leaks, and cleaned up correctly. ==="
+            ? overallPassText
             : "=== OVERALL RESULT: FAIL - see the failed step(s) and acceptance summary above. Do NOT consider Whole Computer mode / PR #3 verified. ===");
 
         return allPassed ? 0 : 1;
@@ -552,6 +670,56 @@ internal static class Program
         {
             stopwatch.Stop();
             return new RawUdpProbeResult(false, $"raw UDP receive from {dnsServerIp}:53 failed after {stopwatch.ElapsedMilliseconds}ms: SocketException ({ex.SocketErrorCode}): {ex.Message}.");
+        }
+    }
+
+    /// <summary>
+    /// Attempts a raw TCP connect to a public IPv6 LITERAL:port (no DNS
+    /// involved at all - <paramref name="ipv6Literal"/> is parsed directly
+    /// via <see cref="IPAddress.Parse"/>) to determine whether this machine
+    /// currently has usable public IPv6 connectivity. Used three times by
+    /// the IPv6 acceptance sequence: once BEFORE routing starts (the
+    /// capability baseline - if this itself fails/times out, this machine
+    /// has no functioning public IPv6 path to leak on at all, and the
+    /// whole IPv6 leak check is a genuine capability SKIP, never a false
+    /// PASS), once WHILE Whole Computer mode is Active (must now fail -
+    /// V0.2 intentionally fail-closes ALL public IPv6, see
+    /// <see cref="ResidentialConnect.Routing.BypassFilterBuilder.BuildIPv6BlockFilter"/>),
+    /// and once AFTER <c>StopAsync</c> (must succeed again, proving IPv6
+    /// networking is fully restored).
+    /// </summary>
+    private static async Task<Ipv6ProbeResult> TryIPv6ProbeAsync(string ipv6Literal, int port, int timeoutSeconds, CancellationToken outerToken)
+    {
+        if (!IPAddress.TryParse(ipv6Literal, out var address) || address.AddressFamily != AddressFamily.InterNetworkV6)
+        {
+            return new Ipv6ProbeResult(false, $"'{ipv6Literal}' is not a valid IPv6 literal - cannot run the IPv6 probe at all (this is a tool configuration problem, not evidence about IPv6 blocking either way).");
+        }
+
+        using var socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(outerToken);
+        linkedCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            await socket.ConnectAsync(address, port, linkedCts.Token);
+            stopwatch.Stop();
+            return new Ipv6ProbeResult(true, $"raw TCP connect to [{address}]:{port} succeeded in {stopwatch.ElapsedMilliseconds}ms - this machine has usable public IPv6 connectivity to this address right now.");
+        }
+        catch (OperationCanceledException)
+        {
+            stopwatch.Stop();
+            return new Ipv6ProbeResult(false, $"raw TCP connect to [{address}]:{port} timed out after {stopwatch.ElapsedMilliseconds}ms (no response within {timeoutSeconds}s).");
+        }
+        catch (SocketException ex)
+        {
+            stopwatch.Stop();
+            return new Ipv6ProbeResult(false, $"raw TCP connect to [{address}]:{port} failed after {stopwatch.ElapsedMilliseconds}ms: SocketException ({ex.SocketErrorCode}): {ex.Message}.");
+        }
+        catch (Exception ex)
+        {
+            stopwatch.Stop();
+            return new Ipv6ProbeResult(false, $"raw TCP connect to [{address}]:{port} failed unexpectedly after {stopwatch.ElapsedMilliseconds}ms: {ex.GetType().Name}: {ex.Message}.");
         }
     }
 
@@ -689,6 +857,32 @@ internal static class Program
         {
             Console.WriteLine("    NOTE: the pre-routing raw UDP/53 baseline itself failed - the 'UDP/53 direct-leak blocked while Active' result above is NOT reliable evidence of this app's leak protection (see Step 1b).");
         }
+
+        // 2026-09-16 second correction: the IPv6 result MUST appear in this
+        // summary - the previous version of this banner had no live IPv6
+        // result feeding it at all, while the overall PASS text nonetheless
+        // claimed public IPv6 leaks were blocked. The three possible states
+        // here are: (1) baseline never worked -> whole triple is SKIP, (2)
+        // baseline worked and both legs passed -> PASS, (3) baseline worked
+        // but either leg failed -> FAIL.
+        if (!summary.Ipv6BaselineWorked)
+        {
+            WriteSummaryLine("Public IPv6 leak test (capability-SKIPPED - no public IPv6 on this machine)", CheckOutcome.Skip);
+            Console.WriteLine("    NOTE: the pre-routing IPv6 capability baseline (IPV6-BASELINE) found no usable public IPv6 path on this machine at all, so the IPv6 fail-closed block could NOT be exercised (see Step 1c). This SKIP is non-fatal and does NOT prove the IPv6 block works - there was simply nothing to leak on here.");
+        }
+        else
+        {
+            var ipv6Pass = summary.Ipv6BlockedWhileActive == true && summary.Ipv6RestoredAfterDisconnect == true;
+            WriteSummaryLine("Public IPv6 direct-leak blocked while Active, and restored after disconnect", ToOutcome(ipv6Pass));
+            if (summary.Ipv6BlockedWhileActive != true)
+            {
+                Console.WriteLine("    NOTE: baseline IPv6 worked (Step 1c) but public IPv6 was NOT blocked while Whole Computer mode was Active (see IPV6-BLOCKED-WHILE-ACTIVE) - a direct IPv6 leak.");
+            }
+            else if (summary.Ipv6RestoredAfterDisconnect != true)
+            {
+                Console.WriteLine("    NOTE: public IPv6 was correctly blocked while Active, but did NOT return after StopAsync (see IPV6-RESTORED-AFTER-DISCONNECT) - cleanup left IPv6 networking broken.");
+            }
+        }
     }
 
     private static void WriteSummaryLine(string label, CheckOutcome outcome)
@@ -720,6 +914,18 @@ internal static class Program
     /// hostname failure or an egress-IP mismatch is always a real FAIL,
     /// never SKIP.
     /// </summary>
+    /// <remarks>
+    /// 2026-09-16 second correction: adds the IPv6 leak-test triple
+    /// (Ipv6BaselineWorked / Ipv6BlockedWhileActive / Ipv6RestoredAfterDisconnect).
+    /// The overall PASS text previously claimed public IPv6 leaks were
+    /// blocked with NO live IPv6 result feeding <see cref="AllRequiredChecksPassed"/>
+    /// at all - this is the fix for that specific gap. Ipv6BlockedWhileActive
+    /// and Ipv6RestoredAfterDisconnect are nullable (<c>bool?</c>), not plain
+    /// <c>bool</c>, because they have a genuine third state: <c>null</c> means
+    /// "capability SKIP - Ipv6BaselineWorked was false, so there was nothing
+    /// to leak on and these two checks were never meaningfully attempted",
+    /// which must never be conflated with either a true PASS or a false FAIL.
+    /// </remarks>
     private sealed class AcceptanceSummary
     {
         public bool UdpDnsBaselineWorked { get; set; }
@@ -729,10 +935,13 @@ internal static class Program
         public CheckOutcome UdpQuicOutcome { get; set; } = CheckOutcome.Fail;
         public bool UdpDnsRestoredAfterDisconnect { get; set; }
         public bool HostnameHttpsRestoredAfterDisconnect { get; set; }
+        public bool Ipv6BaselineWorked { get; set; }
+        public bool? Ipv6BlockedWhileActive { get; set; }
+        public bool? Ipv6RestoredAfterDisconnect { get; set; }
 
         /// <summary>
         /// Overall PASS requires every required check to have passed. The
-        /// UDP/QUIC check is the one exception: SKIP (a genuine, detected
+        /// UDP/QUIC check is one exception: SKIP (a genuine, detected
         /// capability limitation - HTTP/3 unavailable on this machine) does
         /// NOT fail the overall run, but an actual FAIL (a real leak, or an
         /// unexpected error while HTTP/3 was attemptable) still does. A
@@ -742,18 +951,47 @@ internal static class Program
         /// IP-literal-only acceptance tests" mandate, these two are now the
         /// non-negotiable core of the gate.
         /// </summary>
+        /// <remarks>
+        /// 2026-09-16 second correction - IPv6 gating rule: if
+        /// <see cref="Ipv6BaselineWorked"/> is <c>false</c>, this machine
+        /// genuinely has no public IPv6 path to leak on, so the IPv6 triple
+        /// is a non-fatal capability SKIP and does NOT affect the overall
+        /// result at all (matching the pre-existing UDP/QUIC SKIP
+        /// precedent). If <see cref="Ipv6BaselineWorked"/> is <c>true</c>,
+        /// BOTH <see cref="Ipv6BlockedWhileActive"/> AND
+        /// <see cref="Ipv6RestoredAfterDisconnect"/> are required to be
+        /// exactly <c>true</c> (not merely non-false) for overall PASS - a
+        /// direct IPv6 leak while Active, OR IPv6 failing to return after
+        /// disconnect, is always a hard FAIL once baseline IPv6 was proven
+        /// to exist.
+        /// </remarks>
         public bool AllRequiredChecksPassed() =>
             HostnameHttpsActive
             && ProxyEgressMatch
             && UdpDns53BlockedWhileActive
             && UdpQuicOutcome != CheckOutcome.Fail
             && UdpDnsRestoredAfterDisconnect
-            && HostnameHttpsRestoredAfterDisconnect;
+            && HostnameHttpsRestoredAfterDisconnect
+            && (!Ipv6BaselineWorked || (Ipv6BlockedWhileActive == true && Ipv6RestoredAfterDisconnect == true));
+
+        /// <summary>
+        /// True only when the IPv6 leak test was actually LIVE-tested end
+        /// to end (baseline worked, and both the while-Active and
+        /// after-disconnect legs actually ran rather than being
+        /// capability-SKIPPED). Used to gate the wording of the overall
+        /// PASS banner so it never claims "IPv6 leaks blocked" when the
+        /// IPv6 check was in fact SKIPPED for lack of any public IPv6 path
+        /// to test on this machine.
+        /// </summary>
+        public bool Ipv6WasLiveTested =>
+            Ipv6BaselineWorked && Ipv6BlockedWhileActive.HasValue && Ipv6RestoredAfterDisconnect.HasValue;
     }
 
     private sealed record RequestResult(bool Success, string Detail, string? ResponseBody);
 
     private sealed record RawUdpProbeResult(bool Responded, string Detail);
+
+    private sealed record Ipv6ProbeResult(bool Connected, string Detail);
 
     private sealed record QuicCheckResult(CheckOutcome Outcome, string Detail);
 
@@ -778,6 +1016,8 @@ internal static class Program
         public string DnsProbeServerIp { get; private init; } = DefaultDnsProbeServerIp;
         public string DnsProbeHostName { get; private init; } = DefaultDnsProbeHostName;
         public string QuicTestUrl { get; private init; } = DefaultQuicTestUrl;
+        public string Ipv6ProbeLiteral { get; private init; } = DefaultIpv6ProbeLiteral;
+        public int Ipv6ProbePort { get; private init; } = DefaultIpv6ProbePort;
 
         public static DiagnosticOptions? Parse(string[] args)
         {
@@ -790,6 +1030,8 @@ internal static class Program
             string dnsProbeServerIp = DefaultDnsProbeServerIp;
             string dnsProbeHostName = DefaultDnsProbeHostName;
             string quicTestUrl = DefaultQuicTestUrl;
+            string ipv6ProbeLiteral = DefaultIpv6ProbeLiteral;
+            int ipv6ProbePort = DefaultIpv6ProbePort;
 
             for (var i = 0; i < args.Length; i++)
             {
@@ -830,6 +1072,13 @@ internal static class Program
                     case "--quic-test-url" when i + 1 < args.Length:
                         quicTestUrl = args[++i];
                         break;
+                    case "--ipv6-test-literal" when i + 1 < args.Length:
+                        ipv6ProbeLiteral = args[++i];
+                        break;
+                    case "--ipv6-test-port" when i + 1 < args.Length && int.TryParse(args[i + 1], out var v6p):
+                        ipv6ProbePort = v6p;
+                        i++;
+                        break;
                     case "--help":
                     case "-h":
                         PrintUsage();
@@ -851,7 +1100,9 @@ internal static class Program
                 ProfileId = profileId,
                 DnsProbeServerIp = dnsProbeServerIp,
                 DnsProbeHostName = dnsProbeHostName,
-                QuicTestUrl = quicTestUrl
+                QuicTestUrl = quicTestUrl,
+                Ipv6ProbeLiteral = ipv6ProbeLiteral,
+                Ipv6ProbePort = ipv6ProbePort
             };
         }
 
@@ -867,6 +1118,8 @@ internal static class Program
             Console.WriteLine("  --dns-test-ip <ip>          Public DNS resolver IP for the raw UDP/53 probe (default: 1.1.1.1)");
             Console.WriteLine("  --dns-test-host <name>      Hostname to query in the raw UDP/53 probe (default: example.com)");
             Console.WriteLine("  --quic-test-url <url>       HTTP/3-capable HTTPS URL for the UDP/443 QUIC block check (default: https://cloudflare-quic.com/)");
+            Console.WriteLine("  --ipv6-test-literal <addr>  Public IPv6 LITERAL (no DNS) used for the IPv6 leak-test baseline/while-Active/after-disconnect probes (default: 2606:4700:4700::1111)");
+            Console.WriteLine("  --ipv6-test-port <n>        TCP port to connect to on the IPv6 literal above (default: 443)");
         }
     }
 }
