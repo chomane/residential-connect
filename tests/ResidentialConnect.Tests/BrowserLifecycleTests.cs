@@ -11,12 +11,12 @@ public sealed class BrowserLifecycleTests : IDisposable
     private readonly List<Process> _processes = new();
     private readonly ProxyProfile _profile = new() { CredentialRef = "test-only" };
 
-    private ChromiumBrowserLauncher Launcher(Func<ILocalForwardingProxy> relay, Func<ProcessStartInfo, Process?>? start = null)
+    private ChromiumBrowserLauncher Launcher(Func<ILocalForwardingProxy> relay, Func<ProcessStartInfo, Process?>? start = null, IBrowserProcessCatalog? catalog = null)
     {
         var credentials = new InMemoryCredentialStore();
         credentials.Save(_profile.CredentialRef, "test-only");
         return new ChromiumBrowserLauncher(new Provider(), credentials, relay, new NullLogger(),
-            start ?? (_ => StartProcess()), _profiles);
+            start ?? (_ => StartProcess()), _profiles, catalog ?? new Catalog());
     }
 
     private Process StartProcess()
@@ -197,6 +197,90 @@ public sealed class BrowserLifecycleTests : IDisposable
             process.Dispose();
         }
         if (Directory.Exists(_profiles)) Directory.Delete(_profiles, recursive: true);
+    }
+
+    private sealed class Catalog : IBrowserProcessCatalog
+    {
+        public readonly List<(Process Process, string Name, string CommandLine)> Entries = new();
+        public int Calls;
+        public bool Fail;
+        public IReadOnlyList<BrowserProcessCandidate> GetProcesses()
+        {
+            Calls++;
+            if (Fail) throw new IOException("test enumeration failure");
+            return Entries.Where(entry => !entry.Process.HasExited)
+                .Select(entry => new BrowserProcessCandidate(Process.GetProcessById(entry.Process.Id), entry.Name, entry.CommandLine)).ToArray();
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Disconnect_ProfileOwnershipSurvivesLauncherExit_AndPreservesOtherProfiles(bool launcherExited, bool manuallyClosed)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var catalog = new Catalog();
+        var relay = new Relay();
+        var launcher = Launcher(() => relay, catalog: catalog);
+        Assert.True((await launcher.LaunchAsync(_profile)).Success);
+        if (launcherExited)
+        {
+            _processes[0].Kill(entireProcessTree: true);
+            await _processes[0].WaitForExitAsync();
+        }
+        using var managed = StartProcess();
+        using var unrelated = StartProcess();
+        var profilePath = Path.Combine(_profiles, _profile.Id.ToString("N"));
+        catalog.Entries.Add((managed, "chrome.exe", "chrome.exe --user-data-dir=\"" + profilePath + "\""));
+        catalog.Entries.Add((unrelated, "chrome.exe", "chrome.exe --user-data-dir=\"" + profilePath + "-other\""));
+        if (manuallyClosed) { managed.Kill(entireProcessTree: true); await managed.WaitForExitAsync(); }
+        await launcher.DisconnectAllAsync();
+        Assert.True(managed.HasExited);
+        Assert.False(unrelated.HasExited);
+        Assert.True(_processes[0].HasExited);
+        Assert.Equal(1, relay.Disposals);
+        var calls = catalog.Calls;
+        await launcher.DisconnectAllAsync();
+        Assert.Equal(calls, catalog.Calls);
+        Assert.False(unrelated.HasExited);
+        Assert.True(Directory.Exists(profilePath));
+    }
+
+    [Fact]
+    public async Task Disconnect_CleansHandoffsForMultipleProfiles()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var catalog = new Catalog();
+        var launcher = Launcher(() => new Relay(), catalog: catalog);
+        var other = new ProxyProfile { CredentialRef = _profile.CredentialRef };
+        foreach (var profile in new[] { _profile, other })
+        {
+            Assert.True((await launcher.LaunchAsync(profile)).Success);
+            _processes[^1].Kill(entireProcessTree: true);
+            await _processes[^1].WaitForExitAsync();
+            var managed = StartProcess();
+            catalog.Entries.Add((managed, "msedge.exe", "msedge.exe --user-data-dir=\"" + Path.Combine(_profiles, profile.Id.ToString("N")) + "\""));
+        }
+        await launcher.DisconnectAllAsync();
+        Assert.All(_processes, process => Assert.True(process.HasExited));
+        foreach (var entry in catalog.Entries) entry.Process.Dispose();
+    }
+
+    [Fact]
+    public async Task EnumerationFailure_StillStopsRelay_AndDoesNotReportSuccessfulDisconnect()
+    {
+        var catalog = new Catalog { Fail = true };
+        var relay = new Relay();
+        var launcher = Launcher(() => relay, catalog: catalog);
+        Assert.True((await launcher.LaunchAsync(_profile)).Success);
+        await Assert.ThrowsAsync<AggregateException>(() => launcher.DisconnectAllAsync());
+        Assert.Equal(1, relay.Stops);
+        Assert.Equal(1, relay.Disposals);
+        await Assert.ThrowsAsync<AggregateException>(() => launcher.DisconnectAllAsync());
+        catalog.Fail = false;
+        await launcher.DisconnectAllAsync();
+        Assert.Equal(1, relay.Disposals);
     }
 
     private sealed class Provider : IBrowserProvider
