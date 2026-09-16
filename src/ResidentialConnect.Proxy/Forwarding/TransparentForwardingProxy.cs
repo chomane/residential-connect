@@ -54,17 +54,27 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
         string password,
         IPAddress bindAddress,
         IOriginalDestinationResolver destinationResolver,
+        IPAddress pinnedProxyAddress,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentException.ThrowIfNullOrEmpty(password);
         ArgumentNullException.ThrowIfNull(bindAddress);
         ArgumentNullException.ThrowIfNull(destinationResolver);
+        ArgumentNullException.ThrowIfNull(pinnedProxyAddress);
 
+        // Dial the pinned IPv4 LITERAL, never profile.Host, for the proxy
+        // hop itself - see ITransparentForwardingProxy.StartAsync's
+        // pinnedProxyAddress remarks for why a second, independent DNS
+        // resolution here could silently diverge from the address the
+        // WinDivert forward filter's own self-exclusion clause excludes,
+        // reopening the exact self-interception loop that clause exists to
+        // prevent.
+        var pinnedProxyHost = pinnedProxyAddress.ToString();
         _connector = profile.Protocol switch
         {
-            ProxyProtocol.Http => new HttpConnectUpstreamConnector(profile.Host, profile.Port, profile.Username, password, _logger),
-            ProxyProtocol.Socks5 => new Socks5UpstreamConnector(profile.Host, profile.Port, profile.Username, password),
+            ProxyProtocol.Http => new HttpConnectUpstreamConnector(pinnedProxyHost, profile.Port, profile.Username, password, _logger),
+            ProxyProtocol.Socks5 => new Socks5UpstreamConnector(pinnedProxyHost, profile.Port, profile.Username, password),
             _ => throw new NotSupportedException($"Protocol {profile.Protocol} not supported by the transparent forwarding proxy.")
         };
         _destinationResolver = destinationResolver;

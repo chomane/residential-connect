@@ -1,3 +1,4 @@
+using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Models;
 using ResidentialConnect.Proxy;
 
@@ -80,7 +81,8 @@ public class DefaultConnectionManagerTests
         var credentialStore = new InMemoryCredentialStore();
         credentialStore.Save("cred-1", "s3cr3t-pass");
         var router = new FakeSystemTrafficRouter();
-        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router);
+        var verifier = new FakeWholeComputerConnectivityVerifier();
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
 
         var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
 
@@ -89,6 +91,84 @@ public class DefaultConnectionManagerTests
         Assert.Equal(SystemRoutingStatus.Active, state.RoutingStatus);
         Assert.Equal(1, router.StartCallCount);
         Assert.Equal("s3cr3t-pass", router.LastPassword);
+        Assert.Equal(1, verifier.VerifyCallCount);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerificationSucceeds_ReportsConnectedWithVerifiedPublicIp()
+    {
+        // The reported PublicIp must come from the VERIFICATION call (the
+        // one that actually proved traffic flows end-to-end through the
+        // now-Active routing), not merely from the earlier direct-to-proxy
+        // connectivity test.
+        var tester = new FakeProxyConnectivityTester { NextResult = ProxyTestResult.Successful("198.51.100.1", TimeSpan.FromMilliseconds(10)) };
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Successful("203.0.113.42") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Connected, state.Status);
+        Assert.Equal("203.0.113.42", state.PublicIp);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerificationFails_ReportsErrorAndRollsRoutingBack()
+    {
+        // Core fail-closed contract for the verification step: if a real,
+        // hostname-addressed request does not actually route through Whole
+        // Computer mode, the UI must NEVER be told Connected, and routing
+        // must be stopped (rolled back) rather than left Active while the
+        // user is told something failed.
+        var tester = new FakeProxyConnectivityTester();
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier
+        {
+            NextResult = WholeComputerVerificationResult.Failed("Whole Computer routing could not carry a real hostname-addressed HTTPS request. Routing has been rolled back.")
+        };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Error, state.Status);
+        Assert.Equal(SystemRoutingStatus.Unavailable, state.RoutingStatus);
+        Assert.Equal(1, router.StartCallCount);
+        Assert.Equal(1, router.StopCallCount);
+        Assert.Contains("rolled back", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerificationFails_NeverLeavesTheUIInConnectedState()
+    {
+        var tester = new FakeProxyConnectivityTester();
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var verifier = new FakeWholeComputerConnectivityVerifier { NextResult = WholeComputerVerificationResult.Failed("timed out") };
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, verifier);
+
+        await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.NotEqual(ConnectionStatus.Connected, manager.CurrentState.Status);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WholeComputer_VerifierThrows_TreatsAsFailedVerificationAndRollsBack()
+    {
+        var tester = new FakeProxyConnectivityTester();
+        var credentialStore = new InMemoryCredentialStore();
+        credentialStore.Save("cred-1", "s3cr3t");
+        var router = new FakeSystemTrafficRouter();
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, new ThrowingWholeComputerConnectivityVerifier());
+
+        var state = await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
+
+        Assert.Equal(ConnectionStatus.Error, state.Status);
+        Assert.Equal(1, router.StopCallCount);
     }
 
     [Fact]
@@ -146,7 +226,7 @@ public class DefaultConnectionManagerTests
         var credentialStore = new InMemoryCredentialStore();
         credentialStore.Save("cred-1", "s3cr3t");
         var router = new FakeSystemTrafficRouter();
-        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router);
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, new FakeWholeComputerConnectivityVerifier());
         await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
 
         await manager.DisconnectAsync();
@@ -186,7 +266,7 @@ public class DefaultConnectionManagerTests
         var credentialStore = new InMemoryCredentialStore();
         credentialStore.Save("cred-1", "s3cr3t");
         var router = new FakeSystemTrafficRouter();
-        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router);
+        var manager = new DefaultConnectionManager(tester, credentialStore, new NullLogger(), router, new FakeWholeComputerConnectivityVerifier());
         await manager.ConnectAsync(MakeProfile(), ConnectionMode.WholeComputer);
 
         ConnectionState? observed = null;

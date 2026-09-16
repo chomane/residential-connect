@@ -129,3 +129,49 @@ public sealed class ThrowingSystemTrafficRouter : ISystemTrafficRouter
 
     public Task StopAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 }
+
+/// <summary>
+/// No-op fake <see cref="IDohResolver"/> so
+/// <see cref="ResidentialConnect.Routing.WinDivertSystemTrafficRouter"/> can
+/// be constructed in tests that run on this Linux sandbox (which never
+/// reach the point of actually calling <see cref="Configure"/>/
+/// <see cref="ResolveAsync"/> - those tests only exercise the
+/// elevation/support-detection contract; see
+/// WinDivertSystemTrafficRouterTests remarks).
+/// </summary>
+public sealed class FakeDohResolver : IDohResolver
+{
+    public void Configure(ProxyProfile profile, string password, System.Net.IPAddress pinnedProxyAddress) { }
+
+    public Task<byte[]> ResolveAsync(byte[] dnsQueryPayload, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("FakeDohResolver never actually resolves - it exists only so WinDivertSystemTrafficRouter can be constructed on non-Windows test hosts.");
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// Scriptable fake <see cref="IWholeComputerConnectivityVerifier"/> so
+/// <see cref="ResidentialConnect.Proxy.DefaultConnectionManager"/>'s
+/// post-routing, pre-"Connected" verification step can be tested (success,
+/// failure-with-rollback) without any real network call.
+/// </summary>
+public sealed class FakeWholeComputerConnectivityVerifier : IWholeComputerConnectivityVerifier
+{
+    public WholeComputerVerificationResult NextResult { get; set; } =
+        WholeComputerVerificationResult.Successful("203.0.113.9");
+
+    public int VerifyCallCount { get; private set; }
+
+    public Task<WholeComputerVerificationResult> VerifyAsync(CancellationToken cancellationToken = default)
+    {
+        VerifyCallCount++;
+        return Task.FromResult(NextResult);
+    }
+}
+
+/// <summary>Dedicated throwing fake for the one "VerifyAsync throws unexpectedly" scenario - mirrors <see cref="ThrowingSystemTrafficRouter"/>'s role for StartAsync.</summary>
+public sealed class ThrowingWholeComputerConnectivityVerifier : IWholeComputerConnectivityVerifier
+{
+    public Task<WholeComputerVerificationResult> VerifyAsync(CancellationToken cancellationToken = default) =>
+        throw new InvalidOperationException("Simulated unexpected verification failure.");
+}

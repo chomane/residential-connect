@@ -42,7 +42,7 @@ public class TransparentForwardingProxyTests
 
         var flowTable = new RedirectFlowTable();
         using var relay = new TransparentForwardingProxy(new NullLogger());
-        var relayPort = await relay.StartAsync(profile, "s3cr3t-pass", IPAddress.Loopback, flowTable, CancellationToken.None);
+        var relayPort = await relay.StartAsync(profile, "s3cr3t-pass", IPAddress.Loopback, flowTable, IPAddress.Loopback, CancellationToken.None);
 
         Assert.True(relay.IsRunning);
 
@@ -89,7 +89,7 @@ public class TransparentForwardingProxyTests
 
         var flowTable = new RedirectFlowTable();
         using var relay = new TransparentForwardingProxy(new NullLogger());
-        var relayPort = await relay.StartAsync(profile, "pass", IPAddress.Loopback, flowTable, CancellationToken.None);
+        var relayPort = await relay.StartAsync(profile, "pass", IPAddress.Loopback, flowTable, IPAddress.Loopback, CancellationToken.None);
 
         using var appSideClient = new TcpClient();
         await appSideClient.ConnectAsync(IPAddress.Loopback, relayPort);
@@ -131,7 +131,7 @@ public class TransparentForwardingProxyTests
 
         var flowTable = new RedirectFlowTable();
         using var relay = new TransparentForwardingProxy(new NullLogger());
-        var relayPort = await relay.StartAsync(profile, "wrong-pass", IPAddress.Loopback, flowTable, CancellationToken.None);
+        var relayPort = await relay.StartAsync(profile, "wrong-pass", IPAddress.Loopback, flowTable, IPAddress.Loopback, CancellationToken.None);
 
         using var appSideClient = new TcpClient();
         await appSideClient.ConnectAsync(IPAddress.Loopback, relayPort);
@@ -169,7 +169,7 @@ public class TransparentForwardingProxyTests
 
         var flowTable = new RedirectFlowTable();
         using var relay = new TransparentForwardingProxy(new NullLogger());
-        var relayPort = await relay.StartAsync(profile, "pass", IPAddress.Loopback, flowTable, CancellationToken.None);
+        var relayPort = await relay.StartAsync(profile, "pass", IPAddress.Loopback, flowTable, IPAddress.Loopback, CancellationToken.None);
 
         await relay.StopAsync();
 
@@ -197,7 +197,7 @@ public class TransparentForwardingProxyTests
 
         var flowTable = new RedirectFlowTable();
         using var relay = new TransparentForwardingProxy(new NullLogger());
-        var relayPort = await relay.StartAsync(profile, "pass", IPAddress.Any, flowTable, CancellationToken.None);
+        var relayPort = await relay.StartAsync(profile, "pass", IPAddress.Any, flowTable, IPAddress.Loopback, CancellationToken.None);
 
         Assert.True(relay.IsRunning);
         Assert.Equal(relayPort, relay.Port);

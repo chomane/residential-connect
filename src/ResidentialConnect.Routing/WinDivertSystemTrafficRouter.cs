@@ -7,6 +7,7 @@ using System.Security.Principal;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
+using ResidentialConnect.Proxy.Dns;
 
 namespace ResidentialConnect.Routing;
 
@@ -176,11 +177,15 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     private const short ForwardPriority = 0;
     private const short ReturnPriority = 0;
     private const short DnsPriority = 0;
+    private const short DnsV6Priority = 0;
     private const short UdpBlockPriority = 0;
+    private const short IPv6BlockPriority = 0;
+    private const short OtherProtocolBlockPriority = 0;
 
     private readonly IAppLogger _logger;
     private readonly RedirectFlowTable _flowTable;
     private readonly Func<ITransparentForwardingProxy> _relayFactory;
+    private readonly Func<IDohResolver> _dohResolverFactory;
     private readonly RoutingStateMarker _stateMarker;
     private readonly object _lock = new();
 
@@ -188,13 +193,22 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     private volatile bool _failClosed;
 
     private ITransparentForwardingProxy? _relay;
+    private IDohResolver? _dohResolver;
     private IntPtr _forwardHandle = WinDivertNative.InvalidHandle;
     private IntPtr _returnHandle = WinDivertNative.InvalidHandle;
     private IntPtr _dnsHandle = WinDivertNative.InvalidHandle;
+    private IntPtr _dnsV6Handle = WinDivertNative.InvalidHandle;
     private IntPtr _udpBlockHandle = WinDivertNative.InvalidHandle;
+    private IntPtr _ipv6BlockHandle = WinDivertNative.InvalidHandle;
+    private IntPtr _otherProtocolBlockHandle = WinDivertNative.InvalidHandle;
     private CancellationTokenSource? _cts;
     private Task? _forwardLoopTask;
     private Task? _returnLoopTask;
+    private Task? _dnsLoopTask;
+    private Task? _dnsV6LoopTask;
+    private long _dnsQueryCount;
+    private long _dnsQuerySuccessCount;
+    private long _dnsQueryFailureCount;
 
     // --- Temporary diagnostic instrumentation (2026-09-15) ---------------
     // Added to pin down exactly where the reflected TCP flow breaks down
@@ -217,8 +231,9 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
     public WinDivertSystemTrafficRouter(
         IAppLogger logger,
         Func<ITransparentForwardingProxy> relayFactory,
-        RoutingStateMarker stateMarker)
-        : this(logger, relayFactory, stateMarker, new RedirectFlowTable())
+        RoutingStateMarker stateMarker,
+        Func<IDohResolver> dohResolverFactory)
+        : this(logger, relayFactory, stateMarker, dohResolverFactory, new RedirectFlowTable())
     {
     }
 
@@ -227,11 +242,13 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         IAppLogger logger,
         Func<ITransparentForwardingProxy> relayFactory,
         RoutingStateMarker stateMarker,
+        Func<IDohResolver> dohResolverFactory,
         RedirectFlowTable flowTable)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _relayFactory = relayFactory ?? throw new ArgumentNullException(nameof(relayFactory));
         _stateMarker = stateMarker ?? throw new ArgumentNullException(nameof(stateMarker));
+        _dohResolverFactory = dohResolverFactory ?? throw new ArgumentNullException(nameof(dohResolverFactory));
         _flowTable = flowTable ?? throw new ArgumentNullException(nameof(flowTable));
         _diagnosticsEnabled = Environment.GetEnvironmentVariable("RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS") == "1";
     }
@@ -273,6 +290,9 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         Interlocked.Exchange(ref _returnCaptureCount, 0);
         Interlocked.Exchange(ref _successfulReinjectionCount, 0);
         Interlocked.Exchange(ref _sendFailureCount, 0);
+        Interlocked.Exchange(ref _dnsQueryCount, 0);
+        Interlocked.Exchange(ref _dnsQuerySuccessCount, 0);
+        Interlocked.Exchange(ref _dnsQueryFailureCount, 0);
 
         try
         {
@@ -283,6 +303,19 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             // managed wrapper).
             WinDivertNative.ValidateAbi();
 
+            // Pinned proxy IPv4 (2026-09-16 addition): resolve profile.Host
+            // to an IPv4 address exactly ONCE, here, before opening any
+            // WinDivert handle - then thread that SAME, single resolved
+            // literal into BOTH the forward filter's own self-exclusion
+            // clause below AND the relay's upstream connector (see
+            // ITransparentForwardingProxy.StartAsync's pinnedProxyAddress
+            // remarks). This closes a bootstrap-DNS-circularity/self-
+            // interception gap: if the relay instead re-resolved
+            // profile.Host itself when dialing the proxy, a second,
+            // independent DNS answer could return a DIFFERENT IP than the
+            // one this filter excludes, causing the relay's own upstream
+            // tunnel to be captured and reflected by its own interception
+            // rules.
             var addresses = await Dns.GetHostAddressesAsync(profile.Host, cancellationToken).ConfigureAwait(false);
             var ipv4Addresses = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToList();
             if (ipv4Addresses.Count == 0)
@@ -290,16 +323,48 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
                 throw new InvalidOperationException($"Could not resolve an IPv4 address for proxy host '{profile.Host}' - refusing to start Whole Computer mode (fail-closed).");
             }
 
+            var pinnedProxyAddress = ipv4Addresses[0];
+
             _relay = _relayFactory();
             _relay.Faulted += OnRelayFaulted;
-            var relayPort = await _relay.StartAsync(profile, password, IPAddress.Any, _flowTable, cancellationToken).ConfigureAwait(false);
+            var relayPort = await _relay.StartAsync(profile, password, IPAddress.Any, _flowTable, pinnedProxyAddress, cancellationToken).ConfigureAwait(false);
 
-            var forwardFilter = BypassFilterBuilder.BuildForwardFilter(ipv4Addresses, profile.Port, relayPort);
+            // Session-scoped proxied DoH resolver (2026-09-16 addition):
+            // configured with the SAME pinned proxy address as every other
+            // upstream tunnel this session opens - see IDohResolver/
+            // ProxiedDohResolver remarks. Configure() itself does no I/O
+            // (only builds the HttpClient/connector), so it is safe to call
+            // unconditionally before any DNS packet is ever captured.
+            _dohResolver = _dohResolverFactory();
+            _dohResolver.Configure(profile, password, pinnedProxyAddress);
+
+            // Invariant (2026-09-16 correction): the exact IP physically
+            // dialed by the upstream connector (pinnedProxyAddress, passed
+            // to _relay.StartAsync above) MUST be the exact, and ONLY, IP
+            // excluded from interception here. Building this self-exclusion
+            // from the full ipv4Addresses list (every IPv4 address the
+            // proxy hostname happened to resolve to) would create bypass
+            // entries for addresses the relay never actually dials -
+            // needless attack surface, and a mismatch against the "exact
+            // dialed IP == exact excluded IP" invariant this clause exists
+            // to guarantee. Always exactly one element.
+            var forwardFilter = BypassFilterBuilder.BuildForwardFilter([pinnedProxyAddress], profile.Port, relayPort);
             var returnFilter = BypassFilterBuilder.BuildReturnFilter(relayPort);
             var dnsFilter = BypassFilterBuilder.BuildDnsFilter();
+            var dnsV6Filter = BypassFilterBuilder.BuildDnsFilterV6();
             var udpBlockFilter = BypassFilterBuilder.BuildUdpBlockFilter();
+            var ipv6BlockFilter = BypassFilterBuilder.BuildIPv6BlockFilter();
+            var otherProtocolBlockFilter = BypassFilterBuilder.BuildOtherProtocolBlockFilter();
 
-            _dnsHandle = OpenHandleOrThrow(dnsFilter, WinDivertNative.Layer.Network, DnsPriority, WinDivertNative.OpenFlags.Drop, "DNS leak-protection");
+            // DNS handles are opened WITHOUT OpenFlags.Drop (2026-09-16
+            // correction): plain UDP/53 is no longer simply blocked - it is
+            // CAPTURED, answered via proxied DoH (see DnsLoop/DnsV6Loop
+            // below), and a synthesized reply is sent back. The three
+            // fail-closed block handles (general UDP, IPv6, other-protocol)
+            // remain Drop-only/in-kernel, exactly as before - only DNS
+            // changed from "block" to "capture and answer".
+            _dnsHandle = OpenHandleOrThrow(dnsFilter, WinDivertNative.Layer.Network, DnsPriority, WinDivertNative.OpenFlags.None, "DNS (IPv4) capture");
+            _dnsV6Handle = OpenHandleOrThrow(dnsV6Filter, WinDivertNative.Layer.Network, DnsV6Priority, WinDivertNative.OpenFlags.None, "DNS (IPv6) capture");
             // Additive, 2026-09-16: general UDP-block leak-protection handle
             // - see BypassFilterBuilder.BuildUdpBlockFilter remarks for why
             // this is a separate Drop handle rather than a change to the
@@ -310,6 +375,16 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             // and it cannot itself affect the verified TCP forward/return
             // pipeline.
             _udpBlockHandle = OpenHandleOrThrow(udpBlockFilter, WinDivertNative.Layer.Network, UdpBlockPriority, WinDivertNative.OpenFlags.Drop, "UDP-block leak-protection");
+            // Additive, 2026-09-16: public-IPv6 fail-closed block handle -
+            // see BypassFilterBuilder.BuildIPv6BlockFilter remarks. Drop-only,
+            // in-kernel, and (per that method's own filter string) never
+            // overlaps the IPv6 DNS capture handle above.
+            _ipv6BlockHandle = OpenHandleOrThrow(ipv6BlockFilter, WinDivertNative.Layer.Network, IPv6BlockPriority, WinDivertNative.OpenFlags.Drop, "IPv6 fail-closed block");
+            // Additive, 2026-09-16: unsupported-public-IPv4-protocol
+            // fail-closed block handle (e.g. ICMP) - see
+            // BypassFilterBuilder.BuildOtherProtocolBlockFilter remarks.
+            // Drop-only, in-kernel.
+            _otherProtocolBlockHandle = OpenHandleOrThrow(otherProtocolBlockFilter, WinDivertNative.Layer.Network, OtherProtocolBlockPriority, WinDivertNative.OpenFlags.Drop, "unsupported-protocol fail-closed block");
             _forwardHandle = OpenHandleOrThrow(forwardFilter, WinDivertNative.Layer.Network, ForwardPriority, WinDivertNative.OpenFlags.None, "forward");
             _returnHandle = OpenHandleOrThrow(returnFilter, WinDivertNative.Layer.Network, ReturnPriority, WinDivertNative.OpenFlags.None, "return");
 
@@ -326,6 +401,8 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             // whole start over this.
             TrySetQueueHeadroom(_forwardHandle, "forward");
             TrySetQueueHeadroom(_returnHandle, "return");
+            TrySetQueueHeadroom(_dnsHandle, "DNS (IPv4)");
+            TrySetQueueHeadroom(_dnsV6Handle, "DNS (IPv6)");
 
             _cts = new CancellationTokenSource();
 
@@ -354,6 +431,17 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             // available, independent of ThreadPool/application load.
             _forwardLoopTask = StartDedicatedThread(() => ForwardLoop(_forwardHandle, relayPort, _cts.Token), "RC-WinDivert-Forward");
             _returnLoopTask = StartDedicatedThread(() => ReturnLoop(_returnHandle, _cts.Token), "RC-WinDivert-Return");
+            // DNS capture loops (2026-09-16 addition): unlike the block
+            // handles above (Drop-only, in-kernel, no user-mode
+            // involvement), these two DO need a dedicated capture loop -
+            // each captured query is handed to _dohResolver and answered
+            // with a synthesized reply (see DnsLoop remarks). Same
+            // dedicated-OS-thread rationale as the forward/return loops
+            // applies equally here: a captured-but-not-serviced-in-time DNS
+            // query is simply dropped by WinDivert's own queue, so this
+            // loop must never be starved for a ThreadPool worker either.
+            _dnsLoopTask = StartDedicatedThread(() => DnsLoop(_dnsHandle, AddressFamily.InterNetwork, _cts.Token), "RC-WinDivert-DNS-v4");
+            _dnsV6LoopTask = StartDedicatedThread(() => DnsLoop(_dnsV6Handle, AddressFamily.InterNetworkV6, _cts.Token), "RC-WinDivert-DNS-v6");
 
             _stateMarker.MarkActive();
             _logger.Info("WinDivertSystemTrafficRouter", $"Whole Computer routing active. Forward filter: \"{forwardFilter}\". Relay listening on 0.0.0.0:{relayPort}.");
@@ -398,7 +486,10 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         ShutdownReceive(_forwardHandle);
         ShutdownReceive(_returnHandle);
         ShutdownReceive(_dnsHandle);
+        ShutdownReceive(_dnsV6Handle);
         ShutdownReceive(_udpBlockHandle);
+        ShutdownReceive(_ipv6BlockHandle);
+        ShutdownReceive(_otherProtocolBlockHandle);
 
         if (_forwardLoopTask is not null)
         {
@@ -410,10 +501,23 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             try { await _returnLoopTask.ConfigureAwait(false); } catch { /* loop already logs its own faults */ }
         }
 
+        if (_dnsLoopTask is not null)
+        {
+            try { await _dnsLoopTask.ConfigureAwait(false); } catch { /* loop already logs its own faults */ }
+        }
+
+        if (_dnsV6LoopTask is not null)
+        {
+            try { await _dnsV6LoopTask.ConfigureAwait(false); } catch { /* loop already logs its own faults */ }
+        }
+
         CloseHandle(ref _forwardHandle);
         CloseHandle(ref _returnHandle);
         CloseHandle(ref _dnsHandle);
+        CloseHandle(ref _dnsV6Handle);
         CloseHandle(ref _udpBlockHandle);
+        CloseHandle(ref _ipv6BlockHandle);
+        CloseHandle(ref _otherProtocolBlockHandle);
 
         if (_relay is not null)
         {
@@ -423,13 +527,21 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             _relay = null;
         }
 
-        _logger.Info("WinDivertSystemTrafficRouter", $"Routing diagnostics summary: forwardCaptures={Interlocked.Read(ref _forwardCaptureCount)}, returnCaptures={Interlocked.Read(ref _returnCaptureCount)}, successfulReinjections={Interlocked.Read(ref _successfulReinjectionCount)}, sendFailures={Interlocked.Read(ref _sendFailureCount)}.");
+        if (_dohResolver is not null)
+        {
+            _dohResolver.Dispose();
+            _dohResolver = null;
+        }
+
+        _logger.Info("WinDivertSystemTrafficRouter", $"Routing diagnostics summary: forwardCaptures={Interlocked.Read(ref _forwardCaptureCount)}, returnCaptures={Interlocked.Read(ref _returnCaptureCount)}, successfulReinjections={Interlocked.Read(ref _successfulReinjectionCount)}, sendFailures={Interlocked.Read(ref _sendFailureCount)}, dnsQueries={Interlocked.Read(ref _dnsQueryCount)}, dnsSuccesses={Interlocked.Read(ref _dnsQuerySuccessCount)}, dnsFailures={Interlocked.Read(ref _dnsQueryFailureCount)}.");
 
         _flowTable.Clear();
         _cts?.Dispose();
         _cts = null;
         _forwardLoopTask = null;
         _returnLoopTask = null;
+        _dnsLoopTask = null;
+        _dnsV6LoopTask = null;
         _failClosed = false;
     }
 
@@ -626,6 +738,238 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         }
     }
 
+    /// <summary>
+    /// Capture loop for one DNS handle (either the IPv4 or the IPv6 one -
+    /// <paramref name="expectedFamily"/> is diagnostic-only, for log
+    /// messages; parsing itself dispatches on which of
+    /// <see cref="WinDivertNative.ParseUdpPacket"/>'s IPv4/IPv6 header
+    /// out-pointers came back non-null, matching whichever handle actually
+    /// captured the packet). 2026-09-16 addition, replacing the previous
+    /// "DNS is simply Drop-blocked" design - see class remarks and
+    /// <see cref="BypassFilterBuilder.BuildDnsFilter"/>/<see cref="BypassFilterBuilder.BuildDnsFilterV6"/>.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="ForwardLoop"/>/<see cref="ReturnLoop"/> (which
+    /// synchronously reflect and resend within the same iteration),
+    /// answering a DNS query requires a real, asynchronous HTTPS round-trip
+    /// through the proxy (<see cref="IDohResolver.ResolveAsync"/>) - so each
+    /// captured query's processing is dispatched onto its own fire-and-forget
+    /// <see cref="Task"/> (<see cref="ProcessDnsQueryAsync"/>) rather than
+    /// awaited inline, so this tight capture loop can immediately go back to
+    /// <c>WinDivertRecv</c> for the NEXT query instead of blocking on one
+    /// query's round-trip - exactly the same "always be ready to service the
+    /// next captured packet promptly" principle documented on the dedicated
+    /// capture threads (see class remarks "Capture-loop scheduling").
+    /// </remarks>
+    private unsafe void DnsLoop(IntPtr handle, AddressFamily expectedFamily, CancellationToken cancellationToken)
+    {
+        var buffer = GC.AllocateUninitializedArray<byte>((int)WinDivertNative.MaxPacketSize, pinned: true);
+
+        try
+        {
+            fixed (byte* packetBuffer = buffer)
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    WinDivertNative.Address address = default;
+
+                    if (!WinDivertNative.Recv(handle, packetBuffer, WinDivertNative.MaxPacketSize, out var recvLen, &address))
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+
+                        var recvError = Marshal.GetLastWin32Error();
+                        _logger.Warning("RoutingDiagnostics", $"WinDivertRecv failed on the DNS ({expectedFamily}) handle (Win32 error {recvError}).");
+                        continue;
+                    }
+
+                    if (recvLen == 0 || recvLen > WinDivertNative.MaxPacketSize)
+                    {
+                        continue;
+                    }
+
+                    if (!TryParseUdpPacket(packetBuffer, recvLen, out var captured))
+                    {
+                        // Fail closed: an unparseable captured "DNS" packet
+                        // is simply dropped - never resent unmodified.
+                        continue;
+                    }
+
+                    var queryNumber = Interlocked.Increment(ref _dnsQueryCount);
+
+                    // Fire-and-forget: resolving via DoH is a real,
+                    // asynchronous HTTPS round-trip and must not block this
+                    // tight capture loop from immediately servicing the
+                    // NEXT query (see method remarks). The original captured
+                    // query packet is NEVER resent/forwarded unmodified
+                    // (fail-closed) - either a synthesized reply is sent
+                    // back once the DoH round-trip completes, or nothing is
+                    // sent at all and the application's own DNS client
+                    // simply times out and retries; a direct, unproxied leak
+                    // of the query is not possible either way.
+                    _ = ProcessDnsQueryAsync(handle, captured, address, queryNumber, cancellationToken);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.Error("WinDivertSystemTrafficRouter", $"DNS ({expectedFamily}) capture loop terminated unexpectedly - failing closed.", ex);
+                _failClosed = true;
+                SetStatus(SystemRoutingStatus.FailedClosed);
+            }
+        }
+    }
+
+    private async Task ProcessDnsQueryAsync(IntPtr handle, CapturedUdpPacket captured, WinDivertNative.Address address, long queryNumber, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (_dohResolver is null)
+            {
+                Interlocked.Increment(ref _dnsQueryFailureCount);
+                return;
+            }
+
+            var dnsResponse = await _dohResolver.ResolveAsync(captured.Payload, cancellationToken).ConfigureAwait(false);
+            var reply = DnsUdpReplyPacketBuilder.BuildReply(captured, dnsResponse);
+
+            SendDnsReply(handle, reply, address, queryNumber);
+            Interlocked.Increment(ref _dnsQuerySuccessCount);
+
+            if (_diagnosticsEnabled)
+            {
+                _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [DNS #{queryNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} answered via proxied DoH ({dnsResponse.Length} byte response).");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Routing is stopping - dropping silently is correct here.
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _dnsQueryFailureCount);
+            _logger.Warning("RoutingDiagnostics", $"DNS query #{queryNumber} ({captured.SrcAddr}:{captured.SrcPort}) failed via proxied DoH ({ex.GetType().Name}); the application will see a timeout rather than a leaked direct query.");
+        }
+    }
+
+    /// <summary>
+    /// Sends a synthesized DNS reply (<see cref="DnsUdpReplyPacketBuilder.BuildReply"/>)
+    /// back through the SAME DNS handle the original query was captured on -
+    /// marked Inbound (<see cref="WinDivertNative.MarkInbound"/>), exactly
+    /// like a real reflected TCP packet, so Windows' own TCP/IP stack
+    /// delivers it to the querying application's UDP socket as a genuine
+    /// incoming reply.
+    /// </summary>
+    private unsafe void SendDnsReply(IntPtr handle, byte[] reply, WinDivertNative.Address address, long queryNumber)
+    {
+        WinDivertNative.MarkInbound(&address);
+
+        fixed (byte* replyBuffer = reply)
+        {
+            if (!WinDivertNative.CalcChecksums(replyBuffer, (uint)reply.Length, &address, 0))
+            {
+                var checksumError = Marshal.GetLastWin32Error();
+                _logger.Warning("RoutingDiagnostics", $"WinDivertHelperCalcChecksums failed for DNS reply #{queryNumber} (Win32 error {checksumError}); dropping instead.");
+                return;
+            }
+
+            if (!WinDivertNative.Send(handle, replyBuffer, (uint)reply.Length, out _, &address))
+            {
+                var sendError = Marshal.GetLastWin32Error();
+                _logger.Warning("RoutingDiagnostics", $"WinDivertSend failed for DNS reply #{queryNumber} (Win32 error {sendError}); dropping instead.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parses a captured packet as a UDP datagram of either IP version, via
+    /// <see cref="WinDivertNative.ParseUdpPacket"/> (the typed-IPv6/UDP
+    /// sibling of <see cref="WinDivertNative.ParsePacket"/> used by the TCP
+    /// path - see that method's remarks for why two managed declarations of
+    /// the same native entry point exist). Copies the raw UDP payload bytes
+    /// into a fresh managed array (<see cref="CapturedUdpPacket.Payload"/>)
+    /// so the parsed result remains valid after this method returns, even
+    /// though the native pointers themselves only remain valid while
+    /// <paramref name="packetBuffer"/> is pinned by the caller's own
+    /// <c>fixed</c> block.
+    /// </summary>
+    private static unsafe bool TryParseUdpPacket(byte* packetBuffer, uint packetLength, out CapturedUdpPacket captured)
+    {
+        captured = null!;
+
+        var result = WinDivertNative.ParseUdpPacket(
+            packetBuffer,
+            packetLength,
+            out var ipv4,
+            out var ipv6,
+            out var protocol,
+            out _,
+            out _,
+            out _,
+            out var udp,
+            out var data,
+            out var dataLen,
+            out _,
+            out _);
+
+        if (!result || udp == null || protocol != 17)
+        {
+            return false;
+        }
+
+        IPAddress srcAddr;
+        IPAddress dstAddr;
+        AddressFamily family;
+
+        if (ipv4 != null)
+        {
+            family = AddressFamily.InterNetwork;
+            srcAddr = NativeIpv4ToIPAddress(ipv4->SrcAddr);
+            dstAddr = NativeIpv4ToIPAddress(ipv4->DstAddr);
+        }
+        else if (ipv6 != null)
+        {
+            family = AddressFamily.InterNetworkV6;
+            srcAddr = NativeIpv6ToIPAddress(ipv6->SrcAddr);
+            dstAddr = NativeIpv6ToIPAddress(ipv6->DstAddr);
+        }
+        else
+        {
+            return false;
+        }
+
+        var payload = dataLen > 0 ? new byte[dataLen] : Array.Empty<byte>();
+        if (dataLen > 0)
+        {
+            Marshal.Copy((IntPtr)data, payload, 0, (int)dataLen);
+        }
+
+        captured = new CapturedUdpPacket(
+            family,
+            srcAddr,
+            NativePortToHost(udp->SrcPort),
+            dstAddr,
+            NativePortToHost(udp->DstPort),
+            payload);
+
+        return true;
+    }
+
+    private static unsafe IPAddress NativeIpv6ToIPAddress(byte* address)
+    {
+        var bytes = new byte[16];
+        for (var i = 0; i < 16; i++)
+        {
+            bytes[i] = address[i];
+        }
+
+        return new IPAddress(bytes);
+    }
+
     private unsafe void ProcessForwardPacket(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address, int relayPort)
     {
         if (!TryParseTcpPacket(packetBuffer, recvLen, out var ip, out var tcp))
@@ -646,8 +990,21 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayPort, _failClosed);
         if (!decision.ShouldReflect)
         {
-            // Fail closed: captured traffic is not resent directly.
-            if (_diagnosticsEnabled)
+            // Fail closed: captured traffic is not resent directly. As of
+            // the 2026-09-16 RejectStale addition, an untracked/stale
+            // public forward-leg packet gets a locally-forged TCP RST sent
+            // back to its own source (see PacketRedirectPlanner.PlanForward
+            // remarks "Fail-closed by construction, with a bounded,
+            // non-bypassing exception for stale public TCP") instead of
+            // being silently dropped - the genuine fail-closed Drop case
+            // (decision.Action == RedirectAction.Drop, i.e. either
+            // _failClosed is true, or the packet is itself already
+            // RST/FIN) is completely unchanged.
+            if (decision.Action == RedirectAction.RejectStale)
+            {
+                SendForgedReset(handle, captured, address, captureNumber);
+            }
+            else if (_diagnosticsEnabled)
             {
                 _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] DROPPED (no reflect decision; failClosed={_failClosed}).");
             }
@@ -770,6 +1127,60 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         tcp->DstPort = HostPortToNative(decision.NewDstPort!.Value);
 
         WinDivertNative.MarkInbound(address);
+    }
+
+    /// <summary>
+    /// Builds (<see cref="TcpResetPacketBuilder.BuildIPv4Reset"/>), checksums,
+    /// and sends a forged TCP RST+ACK back to <paramref name="captured"/>'s
+    /// own source - the <see cref="RedirectAction.RejectStale"/> path (see
+    /// <see cref="PacketRedirectPlanner"/> remarks). Marked Inbound before
+    /// sending, exactly like a real reflected packet, so Windows' own TCP/IP
+    /// stack delivers it to the application's socket as a genuine incoming
+    /// reset rather than treating it as an ordinary (and, for this
+    /// source/destination pairing, likely-anti-spoofing-rejected) outbound
+    /// send.
+    /// </summary>
+    private unsafe void SendForgedReset(IntPtr handle, CapturedTcpPacket captured, WinDivertNative.Address* address, long captureNumber)
+    {
+        byte[] reset;
+        try
+        {
+            reset = TcpResetPacketBuilder.BuildIPv4Reset(captured);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Defensive only - PacketRedirectPlanner.PlanForward should
+            // never choose RejectStale for an already-RST/FIN packet (see
+            // that guard in its own remarks). If this is ever hit, fail
+            // closed by simply dropping rather than propagating.
+            _logger.Warning("RoutingDiagnostics", $"SendForgedReset called for a packet that should never have reached RejectStale: {ex.Message}");
+            return;
+        }
+
+        var resetAddress = *address;
+        WinDivertNative.MarkInbound(&resetAddress);
+
+        fixed (byte* resetBuffer = reset)
+        {
+            if (!WinDivertNative.CalcChecksums(resetBuffer, (uint)reset.Length, &resetAddress, 0))
+            {
+                var checksumError = Marshal.GetLastWin32Error();
+                _logger.Warning("RoutingDiagnostics", $"WinDivertHelperCalcChecksums failed while building a forged RST for #{captureNumber} (Win32 error {checksumError}); dropping instead.");
+                return;
+            }
+
+            if (!WinDivertNative.Send(handle, resetBuffer, (uint)reset.Length, out _, &resetAddress))
+            {
+                var sendError = Marshal.GetLastWin32Error();
+                _logger.Warning("RoutingDiagnostics", $"WinDivertSend failed while sending a forged RST for #{captureNumber} (Win32 error {sendError}); dropping instead.");
+                return;
+            }
+        }
+
+        if (_diagnosticsEnabled)
+        {
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] untracked/stale public TCP - sent a forged RST to {captured.SrcAddr}:{captured.SrcPort} instead of dropping silently.");
+        }
     }
 
     private unsafe void RecalculateAndSend(IntPtr handle, byte* packetBuffer, uint recvLen, WinDivertNative.Address* address, string legName, CapturedTcpPacket captured, long captureNumber)

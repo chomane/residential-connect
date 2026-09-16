@@ -62,15 +62,36 @@ public class PacketRedirectPlannerTests
     }
 
     [Fact]
-    public void PlanForward_UntrackedNonSynPacket_FailsClosed()
+    public void PlanForward_UntrackedNonSynPacket_RejectsStale_NeverReflectsAndNeverBypassesDirect()
     {
         // A connection that was already established BEFORE Whole Computer
-        // mode was turned on - the product requirement is that this must
-        // never be silently allowed through unmodified.
+        // mode was turned on (or otherwise untracked/stale public TCP).
+        // 2026-09-16 correction: this must NEVER be reflected (that's the
+        // proxy path) and must NEVER be treated as "pass through unmodified"
+        // (that would bypass the proxy over the user's real connection) -
+        // the only safe, non-hanging outcome is RejectStale (a forged RST
+        // per WinDivert's official netfilter.c technique), which prompts the
+        // application to reconnect with a fresh SYN.
         var flowTable = new RedirectFlowTable();
         var decision = PacketRedirectPlanner.PlanForward(Data(60000, ClientAddr, RealDestPort, RealDestAddr), flowTable, RelayPort, failClosed: false);
 
         Assert.False(decision.ShouldReflect);
+        Assert.Equal(RedirectAction.RejectStale, decision.Action);
+    }
+
+    [Fact]
+    public void PlanForward_UntrackedPacketThatIsItselfRstOrFin_IsDroppedNotRejected()
+    {
+        // Mirrors the official netfilter.c sample: never send a reset in
+        // response to a packet that is itself RST/FIN - there is nothing
+        // useful to reject, and doing so would be a pointless reset-of-a-reset.
+        var flowTable = new RedirectFlowTable();
+
+        var rstDecision = PacketRedirectPlanner.PlanForward(Data(60000, ClientAddr, RealDestPort, RealDestAddr, rst: true), flowTable, RelayPort, failClosed: false);
+        var finDecision = PacketRedirectPlanner.PlanForward(Data(60001, ClientAddr, RealDestPort, RealDestAddr, fin: true), flowTable, RelayPort, failClosed: false);
+
+        Assert.Equal(RedirectAction.Drop, rstDecision.Action);
+        Assert.Equal(RedirectAction.Drop, finDecision.Action);
     }
 
     [Fact]
@@ -80,9 +101,24 @@ public class PacketRedirectPlannerTests
         var decision = PacketRedirectPlanner.PlanForward(Syn(), flowTable, RelayPort, failClosed: true);
 
         Assert.False(decision.ShouldReflect);
+        Assert.Equal(RedirectAction.Drop, decision.Action);
         // And crucially, it must not have been recorded either - no new
         // flows are established while fail-closed.
         Assert.False(flowTable.TryGetFlow(ClientPort, out _, out _));
+    }
+
+    [Fact]
+    public void PlanForward_WhenFailClosed_UntrackedPacketIsHardDropped_NeverRejectStale()
+    {
+        // The genuine fail-closed state (upstream relay/tunnel faulted) must
+        // remain a hard Drop for ALL packets, including ones that would
+        // otherwise get RejectStale - public traffic must stay blocked, not
+        // "helpfully" reset, while the router cannot guarantee proxied
+        // delivery.
+        var flowTable = new RedirectFlowTable();
+        var decision = PacketRedirectPlanner.PlanForward(Data(60000, ClientAddr, RealDestPort, RealDestAddr), flowTable, RelayPort, failClosed: true);
+
+        Assert.Equal(RedirectAction.Drop, decision.Action);
     }
 
     [Fact]

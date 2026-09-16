@@ -5,6 +5,7 @@ using ResidentialConnect.Core.Common;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Browser;
 using ResidentialConnect.Proxy;
+using ResidentialConnect.Proxy.Dns;
 using ResidentialConnect.Proxy.Forwarding;
 using ResidentialConnect.Proxy.IpEcho;
 using ResidentialConnect.Proxy.Repository;
@@ -54,7 +55,11 @@ public partial class App : Application
         // never call it from DefaultConnectionManager when BrowserOnly is
         // selected.
         ISystemTrafficRouter? trafficRouter = OperatingSystem.IsWindows()
-            ? new WinDivertSystemTrafficRouter(logger, () => new TransparentForwardingProxy(logger), routingStateMarker)
+            ? new WinDivertSystemTrafficRouter(
+                logger,
+                () => new TransparentForwardingProxy(logger),
+                routingStateMarker,
+                () => new ProxiedDohResolver(logger))
             : null;
 
         var connectionManager = new DefaultConnectionManager(tester, credentialStore, logger, trafficRouter);

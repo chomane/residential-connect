@@ -20,6 +20,7 @@ public sealed class DefaultConnectionManager : IConnectionManager
     private readonly IProxyConnectivityTester _tester;
     private readonly ICredentialStore _credentialStore;
     private readonly ISystemTrafficRouter? _trafficRouter;
+    private readonly IWholeComputerConnectivityVerifier _wholeComputerVerifier;
     private readonly IAppLogger _logger;
     private readonly object _lock = new();
 
@@ -37,18 +38,28 @@ public sealed class DefaultConnectionManager : IConnectionManager
     /// same <see cref="ProxyProfile.CredentialRef"/> lookup
     /// <see cref="HttpProxyConnectivityTester"/> already uses for the
     /// connectivity test above, kept only in memory for the duration of this
-    /// call, never logged.
+    /// call, never logged. <paramref name="wholeComputerVerifier"/> defaults
+    /// to a real <see cref="HostnameConnectivityVerifier"/> when omitted so
+    /// existing callers (the WPF composition root) get the correct
+    /// production behavior without having to know this dependency exists;
+    /// tests inject a scriptable fake instead - see
+    /// <see cref="IWholeComputerConnectivityVerifier"/> remarks for why this
+    /// check exists at all (never report Connected before a real,
+    /// hostname-addressed request has been proven to route through Whole
+    /// Computer mode end-to-end).
     /// </summary>
     public DefaultConnectionManager(
         IProxyConnectivityTester tester,
         ICredentialStore credentialStore,
         IAppLogger logger,
-        ISystemTrafficRouter? trafficRouter = null)
+        ISystemTrafficRouter? trafficRouter = null,
+        IWholeComputerConnectivityVerifier? wholeComputerVerifier = null)
     {
         _tester = tester ?? throw new ArgumentNullException(nameof(tester));
         _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _trafficRouter = trafficRouter;
+        _wholeComputerVerifier = wholeComputerVerifier ?? new HostnameConnectivityVerifier(_logger);
     }
 
     public event EventHandler<ConnectionState>? StateChanged;
@@ -194,17 +205,66 @@ public sealed class DefaultConnectionManager : IConnectionManager
             return failedRoutingState;
         }
 
+        // Routing reports Active, but that only proves the WinDivert handles
+        // opened successfully - it does NOT prove real traffic actually
+        // flows through them end-to-end. Per the standing "no more
+        // IP-literal-only acceptance tests; no declaring Whole Computer
+        // verified until real hostname browsing works" mandate, the UI must
+        // never be told Connected until a real, hostname-addressed request
+        // has been proven to route through the now-Active pipeline. If that
+        // fails, roll routing back and report Error - never leave the router
+        // Active while telling the user (incorrectly) that verification
+        // failed but their traffic is still unprotected.
+        _logger.Info("ConnectionManager", $"Whole Computer routing reports Active for '{profile.Name}' - verifying with a real hostname-addressed request before reporting Connected.");
+
+        WholeComputerVerificationResult verification;
+        try
+        {
+            verification = await _wholeComputerVerifier.VerifyAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("ConnectionManager", "IWholeComputerConnectivityVerifier.VerifyAsync threw unexpectedly - treating as failed verification (fail-closed).", ex);
+            verification = WholeComputerVerificationResult.Failed("Verification threw unexpectedly.");
+        }
+
+        if (!verification.Success)
+        {
+            _trafficRouter.StatusChanged -= OnRoutingStatusChanged;
+            _logger.Warning("ConnectionManager", $"Whole Computer post-routing verification FAILED for '{profile.Name}': {verification.FailureMessage}. Rolling routing back.");
+
+            try
+            {
+                await _trafficRouter.StopAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("ConnectionManager", "Error stopping whole-computer routing during verification-failure rollback.", ex);
+            }
+
+            var verificationFailedState = new ConnectionState
+            {
+                Status = ConnectionStatus.Error,
+                ActiveProxy = profile,
+                Mode = ConnectionMode.WholeComputer,
+                RoutingStatus = SystemRoutingStatus.Unavailable,
+                StatusMessage = verification.FailureMessage ?? "Whole Computer routing could not be verified. Routing has been rolled back."
+            };
+            SetState(verificationFailedState);
+            return verificationFailedState;
+        }
+
         var activeState = new ConnectionState
         {
             Status = ConnectionStatus.Connected,
             ActiveProxy = profile,
             Mode = ConnectionMode.WholeComputer,
             RoutingStatus = SystemRoutingStatus.Active,
-            PublicIp = result.ObservedPublicIp,
+            PublicIp = verification.ObservedPublicIp ?? result.ObservedPublicIp,
             Latency = result.Latency,
             StatusMessage = "Connected (Whole Computer)"
         };
-        _logger.Info("ConnectionManager", $"Whole Computer routing active for '{profile.Name}'.");
+        _logger.Info("ConnectionManager", $"Whole Computer routing active and VERIFIED for '{profile.Name}'.");
         SetState(activeState);
         return activeState;
     }

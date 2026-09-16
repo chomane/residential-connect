@@ -16,7 +16,11 @@ namespace ResidentialConnect.Tests;
 public class WinDivertSystemTrafficRouterTests
 {
     private static WinDivertSystemTrafficRouter CreateRouter(string markerPath) =>
-        new(new NullLogger(), () => new TransparentForwardingProxy(new NullLogger()), new RoutingStateMarker(markerPath, new NullLogger()));
+        new(
+            new NullLogger(),
+            () => new TransparentForwardingProxy(new NullLogger()),
+            new RoutingStateMarker(markerPath, new NullLogger()),
+            () => new FakeDohResolver());
 
     [Fact]
     public void RequiresElevation_IsAlwaysTrue()

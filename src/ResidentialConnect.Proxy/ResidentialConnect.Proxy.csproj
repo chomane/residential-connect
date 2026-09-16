@@ -11,4 +11,15 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!--
+      Lets ResidentialConnect.Tests use ProxiedDohResolver's internal
+      test-only constructor overload (dohEndpointOverride) so
+      ProxiedDohResolverTests can point the resolver at a local fake DoH
+      server instead of the real cloudflare-dns.com endpoint, without a
+      real network call.
+    -->
+    <InternalsVisibleTo Include="ResidentialConnect.Tests" />
+  </ItemGroup>
+
 </Project>

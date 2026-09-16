@@ -3,6 +3,8 @@ using ResidentialConnect.Core.Models;
 
 namespace ResidentialConnect.Core.Abstractions;
 
+
+
 /// <summary>
 /// The Whole Computer (V0.2) counterpart of <see cref="ILocalForwardingProxy"/>.
 /// Where <see cref="ILocalForwardingProxy"/> is a loopback-only HTTP CONNECT
@@ -48,11 +50,36 @@ public interface ITransparentForwardingProxy : IDisposable
     /// connections can reach it - unlike <see cref="ILocalForwardingProxy"/>,
     /// which is intentionally loopback-only) and returns the bound port.
     /// </summary>
+    /// <param name="pinnedProxyAddress">
+    /// The single, already-resolved IPv4 literal to dial for EVERY upstream
+    /// tunnel this relay opens - 2026-09-16 addition ("pinned proxy IPv4").
+    /// <see cref="Core.Abstractions.ISystemTrafficRouter"/>'s caller resolves
+    /// <see cref="ProxyProfile.Host"/> to an IPv4 address exactly ONCE,
+    /// before opening any WinDivert handle (see that method's remarks), and
+    /// builds the forward filter's own proxy self-exclusion clause
+    /// (<see cref="Routing"/>'s <c>BypassFilterBuilder.BuildForwardFilter</c>)
+    /// from that SAME resolved address. If this relay instead re-resolved
+    /// <paramref name="profile"/>'s <see cref="ProxyProfile.Host"/> itself
+    /// (e.g. inside <see cref="HttpConnectUpstreamConnector"/>'s own
+    /// <c>TcpClient.ConnectAsync(string, int, ...)</c> overload, which
+    /// performs its own independent DNS lookup) a second, independent DNS
+    /// answer could return a DIFFERENT IP than the one the filter's
+    /// self-exclusion clause actually excludes - at which point this
+    /// relay's own outbound tunnel to the proxy would itself be captured by
+    /// the forward filter and fed back into the reflection pipeline,
+    /// exactly the self-interception loop the self-exclusion clause exists
+    /// to prevent. Passing the identical, already-resolved literal here
+    /// closes that gap: this relay dials the literal IP directly (bypassing
+    /// its own connector's hostname resolution entirely for the proxy hop),
+    /// guaranteeing it can never resolve to anything other than what the
+    /// filter excludes.
+    /// </param>
     Task<int> StartAsync(
         ProxyProfile profile,
         string password,
         IPAddress bindAddress,
         IOriginalDestinationResolver destinationResolver,
+        IPAddress pinnedProxyAddress,
         CancellationToken cancellationToken = default);
 
     Task StopAsync();

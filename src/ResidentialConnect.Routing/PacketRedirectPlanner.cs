@@ -104,29 +104,98 @@ public readonly record struct CapturedTcpPacket(
 /// remote server it believes it is talking to.
 /// </para>
 /// <para>
-/// <b>Fail-closed by construction:</b> every code path that is not an
-/// explicit, tracked redirect returns <see cref="RedirectDecision.Drop"/>.
-/// In particular, a packet that is neither a brand-new SYN nor part of an
-/// already-tracked flow (e.g. a connection that was already established
-/// before Whole Computer mode was turned on) is DROPPED rather than resent
-/// unmodified - satisfying "packets that would have been redirected are
-/// never silently allowed to reach the real network". The trade-off,
-/// documented as a known limitation, is that pre-existing connections stall
-/// when Whole Computer mode is enabled rather than continuing unprotected.
+/// <b>Fail-closed by construction, with a bounded, non-bypassing exception
+/// for stale public TCP (2026-09-16 correction):</b> every forward-leg
+/// packet that is not an explicit, tracked redirect used to return
+/// <see cref="RedirectDecision.Drop"/> unconditionally. Real-world testing
+/// showed this silently killed EVERY pre-existing TCP connection the moment
+/// Whole Computer mode started (ordinary browser tabs, Telegram, etc.),
+/// making the machine's networking appear completely broken - an
+/// unacceptable UX regression, even though it was technically "safe" (no
+/// bypass occurred). The FIX IS NOT to let such a packet through unmodified
+/// - doing so would send it over the user's real, non-proxied Internet
+/// connection, which is exactly the bypass Whole Computer mode must never
+/// allow. Instead, an untracked, non-SYN, non-RST, non-FIN forward-leg
+/// packet is answered with a locally-forged TCP RST (see
+/// <see cref="RejectStale"/>) - adapted directly from WinDivert's own
+/// official <c>examples/netfilter/netfilter.c</c> sample (the documented,
+/// canonical WinDivert technique for "block this TCP connection" - see
+/// <see cref="WinDivertSystemTrafficRouter"/> remarks for the exact
+/// sequence/ack construction, copied verbatim from that sample rather than
+/// invented here). The RST causes the application's OS-level socket to see
+/// an immediate, clean connection reset instead of a silent hang; any
+/// reasonable client (browser, HTTP library) then opens a brand-new
+/// connection, whose SYN IS a brand-new SYN - which this planner redirects
+/// through the proxy normally on its very next packet. The genuine
+/// fail-closed case (<paramref name="failClosed"/> true, i.e. the upstream
+/// relay/tunnel itself has faulted) is completely unchanged: EVERY packet,
+/// tracked or not, new SYN or not, is still hard <see cref="Drop"/> - public
+/// traffic must remain blocked, never falling back direct, while the router
+/// cannot guarantee proxied delivery.
+/// </para>
+/// <para>
+/// <b>Why RejectStale is scoped to the FORWARD leg only:</b> the return leg
+/// (<see cref="PacketRedirectPlanner.PlanReturn"/>) only ever sees the local
+/// relay's OWN reply traffic (see <see cref="BypassFilterBuilder.BuildReturnFilter"/>
+/// - the filter itself requires <c>tcp.SrcPort == relayPort</c>), never a
+/// real application's outbound Internet traffic. An untracked return-leg
+/// packet is data addressed to the relay's own listening port for a flow no
+/// longer in the table - dropping it is harmless (nothing "hangs" from the
+/// application's perspective; TCP retransmission/timeout on the RELAY's own
+/// socket, not the user's, handles it) and forging a reset there would only
+/// ever reset the LOCAL relay's own loopback-adjacent socket, which serves
+/// no purpose. <see cref="PlanReturn"/> is therefore intentionally
+/// unchanged by this fix.
+/// </para>
+/// <para>
+/// <b>Why LAN/local destinations never reach this decision at all:</b> per
+/// the corrected architecture, private/LAN/multicast/broadcast destinations
+/// are excluded at the WinDivert FILTER level itself
+/// (<see cref="BypassFilterBuilder.BuildForwardFilter"/>) - they are never
+/// captured into user mode in the first place, so this planner never has to
+/// reason about them. Every packet <see cref="PlanForward"/> actually sees
+/// is, by construction, real public Internet TCP.
 /// </para>
 /// </remarks>
 public readonly record struct RedirectDecision(
-    bool ShouldReflect,
+    RedirectAction Action,
     IPAddress? NewSrcAddr,
     int? NewSrcPort,
     IPAddress? NewDstAddr,
     int? NewDstPort)
 {
-    /// <summary>Never resend this packet - the fail-closed behavior for anything not explicitly redirected.</summary>
-    public static readonly RedirectDecision Drop = new(false, null, null, null, null);
+    /// <summary>Never resend this packet - the fail-closed behavior for anything not explicitly redirected while the router itself has faulted.</summary>
+    public static readonly RedirectDecision Drop = new(RedirectAction.Drop, null, null, null, null);
 
     public static RedirectDecision Reflect(IPAddress newSrcAddr, int newSrcPort, IPAddress newDstAddr, int newDstPort) =>
-        new(true, newSrcAddr, newSrcPort, newDstAddr, newDstPort);
+        new(RedirectAction.Reflect, newSrcAddr, newSrcPort, newDstAddr, newDstPort);
+
+    /// <summary>
+    /// Forge and send a TCP RST to the packet's own source, per WinDivert's
+    /// official <c>netfilter.c</c> "reject" technique - see class remarks
+    /// "Fail-closed by construction, with a bounded, non-bypassing exception
+    /// for stale public TCP". No address/port fields are needed here (unlike
+    /// <see cref="Reflect"/>) because <see cref="WinDivertSystemTrafficRouter"/>
+    /// builds the reset packet directly from the ORIGINAL captured packet's
+    /// own header fields, exactly as the official sample does.
+    /// </summary>
+    public static readonly RedirectDecision RejectStale = new(RedirectAction.RejectStale, null, null, null, null);
+
+    /// <summary>Back-compat convenience for existing call sites/tests that only care about the redirect (not reject) case.</summary>
+    public bool ShouldReflect => Action == RedirectAction.Reflect;
+}
+
+/// <summary>The three possible dispositions <see cref="PacketRedirectPlanner"/> can decide for a captured packet.</summary>
+public enum RedirectAction
+{
+    /// <summary>Never resend this packet - used only while the router itself is in the fault (failClosed) state.</summary>
+    Drop,
+
+    /// <summary>Swap source/destination and flip Outbound-&gt;Inbound before resending - the normal, proven redirect path.</summary>
+    Reflect,
+
+    /// <summary>Forge a TCP RST back to the packet's source (see <see cref="RedirectDecision.RejectStale"/>) - forward-leg-only, for untracked/stale public TCP.</summary>
+    RejectStale
 }
 
 /// <summary>
@@ -198,9 +267,22 @@ public static class PacketRedirectPlanner
         }
 
         // Not a new SYN and not a tracked flow: most likely a connection
-        // that was already established before Whole Computer mode started.
-        // Fail closed - see class remarks.
-        return RedirectDecision.Drop;
+        // that was already established before Whole Computer mode started
+        // (or a SYN WinDivert's queue happened to drop under load - see
+        // WinDivertSystemTrafficRouter remarks). This packet's own RST/FIN
+        // flags are also checked here (not just left to the router) so a
+        // packet that is ITSELF a close/reset never gets an unnecessary,
+        // pointless reset-of-a-reset sent back for it - see class remarks
+        // "Fail-closed by construction, with a bounded, non-bypassing
+        // exception for stale public TCP" and the official netfilter.c
+        // sample this mirrors (which likewise never resets an already
+        // Rst/Fin packet).
+        if (packet.IsRst || packet.IsFin)
+        {
+            return RedirectDecision.Drop;
+        }
+
+        return RedirectDecision.RejectStale;
     }
 
     /// <summary>

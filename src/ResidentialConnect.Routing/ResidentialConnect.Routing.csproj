@@ -37,4 +37,19 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!--
+      Lets ResidentialConnect.Tests call WinDivertNative.TryCompileFilter
+      directly (on a real Windows machine only - see
+      BypassFilterBuilderTests "..._CompilesAgainstTheRealWinDivertParser"
+      tests, which are runtime-guarded with OperatingSystem.IsWindows() and
+      are no-ops elsewhere) to validate every generated filter string
+      against WinDivert's OWN native parser, not just this project's own
+      assumptions about its grammar - per the explicit instruction "where
+      possible, use WinDivert's filter compilation helper to validate every
+      generated filter string".
+    -->
+    <InternalsVisibleTo Include="ResidentialConnect.Tests" />
+  </ItemGroup>
+
 </Project>

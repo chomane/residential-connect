@@ -8,6 +8,7 @@ using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Common;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
+using ResidentialConnect.Proxy.Dns;
 using ResidentialConnect.Proxy.Forwarding;
 using ResidentialConnect.Proxy.Repository;
 using ResidentialConnect.Routing;
@@ -145,7 +146,8 @@ internal static class Program
         var router = new WinDivertSystemTrafficRouter(
             logger,
             () => new TransparentForwardingProxy(logger),
-            stateMarker);
+            stateMarker,
+            () => new ProxiedDohResolver(logger));
 
         if (!router.IsSupported)
         {

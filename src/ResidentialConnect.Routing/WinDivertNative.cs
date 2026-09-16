@@ -206,6 +206,42 @@ internal static unsafe class WinDivertNative
         internal bool Urg => (HeaderLengthAndFlags & 0x2000) != 0;
     }
 
+    /// <summary>
+    /// Raw UDP header layout (2026-09-16 addition, required for the IPv4/IPv6
+    /// DNS-over-HTTPS capture path - correction #2/#4/#9). All fields are
+    /// network (big-endian) byte order, exactly like <see cref="TcpHeader"/>.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal struct UdpHeader
+    {
+        internal ushort SrcPort;
+        internal ushort DstPort;
+        internal ushort Length;
+        internal ushort Checksum;
+    }
+
+    /// <summary>
+    /// Raw, fixed 40-byte IPv6 header layout (2026-09-16 addition, required
+    /// for the IPv6 UDP/53 DNS capture path - correction #2). Extension
+    /// headers are deliberately NOT parsed/handled: V0.2's IPv6 DNS capture
+    /// only needs the fixed header's addresses/payload-length/next-header
+    /// fields for a plain UDP/53 packet, and any IPv6 packet carrying
+    /// extension headers before UDP does not match the simple
+    /// <c>ipv6 and udp.DstPort == 53</c> filter WinDivert itself compiles
+    /// against (WinDivert's own <c>udp</c> filter macro already requires the
+    /// next header immediately following this fixed header to be UDP).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal struct IPv6Header
+    {
+        internal uint VersionClassFlow;
+        internal ushort PayloadLength;
+        internal byte NextHeader;
+        internal byte HopLimit;
+        internal fixed byte SrcAddr[16];
+        internal fixed byte DstAddr[16];
+    }
+
     [DllImport(
         "WinDivert.dll",
         EntryPoint = "WinDivertOpen",
@@ -296,6 +332,41 @@ internal static unsafe class WinDivertNative
         out TcpHeader* tcpHeader,
         out IntPtr udpHeader,
         out IntPtr data,
+        out uint dataLen,
+        out IntPtr next,
+        out uint nextLen);
+
+    /// <summary>
+    /// Second, distinctly-typed managed declaration of the exact same
+    /// native <c>WinDivertHelperParsePacket</c> entry point as
+    /// <see cref="ParsePacket"/> above, returning typed
+    /// <see cref="IPv6Header"/>*/<see cref="UdpHeader"/>* pointers instead
+    /// of the opaque <see cref="IntPtr"/>s that overload leaves unused -
+    /// added 2026-09-16 for the IPv4/IPv6 UDP/53 DNS capture path
+    /// (correction #2/#4/#9). Multiple <c>DllImport</c> declarations of the
+    /// same native entry point with different managed signatures are legal
+    /// in C# (the CLR only cares about the native symbol name and calling
+    /// convention matching) - this avoids needing a single combined
+    /// signature with every field typed, which would make the far more
+    /// heavily-used TCP call sites (<see cref="WinDivertSystemTrafficRouter.TryParseTcpPacket"/>)
+    /// less readable for no benefit.
+    /// </summary>
+    [DllImport(
+        "WinDivert.dll",
+        EntryPoint = "WinDivertHelperParsePacket",
+        CallingConvention = CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ParseUdpPacket(
+        void* packet,
+        uint packetLen,
+        out IPv4Header* ipv4Header,
+        out IPv6Header* ipv6Header,
+        out byte protocol,
+        out IntPtr icmpHeader,
+        out IntPtr icmpv6Header,
+        out IntPtr tcpHeader,
+        out UdpHeader* udpHeader,
+        out byte* data,
         out uint dataLen,
         out IntPtr next,
         out uint nextLen);
@@ -391,6 +462,20 @@ internal static unsafe class WinDivertNative
         {
             throw new InvalidOperationException(
                 $"WinDivert TCP header ABI mismatch. Expected 20 bytes, got {tcpSize}.");
+        }
+
+        var udpSize = Marshal.SizeOf<UdpHeader>();
+        if (udpSize != 8)
+        {
+            throw new InvalidOperationException(
+                $"WinDivert UDP header ABI mismatch. Expected 8 bytes, got {udpSize}.");
+        }
+
+        var ipv6Size = sizeof(IPv6Header);
+        if (ipv6Size != 40)
+        {
+            throw new InvalidOperationException(
+                $"WinDivert IPv6 header ABI mismatch. Expected 40 bytes, got {ipv6Size}.");
         }
 
         var ifIdxOffset = Marshal.OffsetOf<Address>(nameof(Address.IfIdx)).ToInt32();
