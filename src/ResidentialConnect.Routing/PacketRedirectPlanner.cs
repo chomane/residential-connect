@@ -19,6 +19,21 @@ namespace ResidentialConnect.Routing;
 /// a partial ("rewrite destination only, keep Outbound") rewrite does not
 /// actually work.
 /// </remarks>
+/// <remarks>
+/// <b>2026-09-16 diagnostic-only extension:</b> <see cref="IsPsh"/>,
+/// <see cref="SeqNum"/>, <see cref="AckNum"/>, <see cref="Window"/>, and
+/// <see cref="PayloadLength"/> were added purely so
+/// <see cref="WinDivertSystemTrafficRouter"/>'s per-packet diagnostic log
+/// lines (gated behind <c>RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS</c>) can
+/// show established-flow data segments (not just the SYN/SYN-ACK/ACK
+/// handshake) - specifically to investigate the "upstream CONNECT succeeded
+/// but the relayed session immediately ended with zero bytes in both
+/// directions" symptom, where the question is whether the client's
+/// post-handshake DATA segment (e.g. its TLS ClientHello) is even being
+/// captured/reflected by WinDivert at all. All five have defaults and do
+/// NOT participate in any decision <see cref="PacketRedirectPlanner"/>
+/// makes - they are read-only, log-only fields.
+/// </remarks>
 public readonly record struct CapturedTcpPacket(
     bool IsSyn,
     bool IsAck,
@@ -27,7 +42,12 @@ public readonly record struct CapturedTcpPacket(
     IPAddress SrcAddr,
     int SrcPort,
     IPAddress DstAddr,
-    int DstPort);
+    int DstPort,
+    bool IsPsh = false,
+    uint SeqNum = 0,
+    uint AckNum = 0,
+    int Window = 0,
+    int PayloadLength = 0);
 
 /// <summary>
 /// Outcome of evaluating one captured packet against the current flow table

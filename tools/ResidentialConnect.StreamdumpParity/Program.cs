@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Text;
 
 namespace ResidentialConnect.StreamdumpParity;
 
@@ -42,6 +43,17 @@ internal static class Program
     private static long _returnCount;
     private static long _reinjectedCount;
     private static long _sendFailureCount;
+
+    /// <summary>
+    /// Fixed, non-secret test payloads for the 2026-09-16 DATA-transfer
+    /// extension of this tool (see class remarks / README.md "DATA test").
+    /// Deliberately plain ASCII, no credentials, no real application
+    /// protocol - the only thing being tested is whether WinDivert's
+    /// reflection technique correctly carries ESTABLISHED-flow payload
+    /// bytes (not just the SYN/SYN-ACK/ACK handshake) in BOTH directions.
+    /// </summary>
+    private static readonly byte[] ClientToServerPayload = Encoding.ASCII.GetBytes("RC-PARITY-PING-7f3a2c81");
+    private static readonly byte[] ServerToClientPayload = Encoding.ASCII.GetBytes("RC-PARITY-PONG-9e4d5b02");
 
     private static async Task<int> Main(string[] args)
     {
@@ -105,7 +117,8 @@ internal static class Program
 
         var listenerCts = new CancellationTokenSource();
         var acceptedTcs = new TaskCompletionSource<IPEndPoint?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var acceptTask = AcceptLoopAsync(listener, acceptedTcs, listenerCts.Token);
+        var dataOutcomeTcs = new TaskCompletionSource<DataTestOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var acceptTask = AcceptLoopAsync(listener, acceptedTcs, dataOutcomeTcs, listenerCts.Token);
 
         // ---- Build the filter: ONLY this one target flow + the local port --
         // Deliberately narrower than streamdump.c's own filter (which
@@ -192,7 +205,48 @@ internal static class Program
         var acceptedEndpoint = await Task.WhenAny(acceptedTcs.Task, Task.Delay(TimeSpan.FromSeconds(3)))
             .ContinueWith(_ => acceptedTcs.Task.IsCompletedSuccessfully ? acceptedTcs.Task.Result : null);
 
-        await Task.Delay(1000);
+        // ---- 2026-09-16 DATA-transfer extension --------------------------
+        // The handshake alone (SYN/SYN-ACK/ACK) proved reflection works for
+        // connection ESTABLISHMENT (see Update 4/5 history in README.md).
+        // This client-side half of the DATA test now sends a small, fixed,
+        // non-secret payload and verifies the fixed response the listener
+        // sends back (see AcceptLoopAsync) is received byte-for-byte - i.e.
+        // it exercises WinDivert reflection for ESTABLISHED-FLOW payload
+        // packets in BOTH directions, not just the handshake packets.
+        var clientReceivedResponse = false;
+        var dataTestDetail = "not attempted (handshake did not complete).";
+
+        if (connected && acceptedEndpoint is not null)
+        {
+            try
+            {
+                var clientStream = probeClient.GetStream();
+                using var dataCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+                Console.WriteLine();
+                Console.WriteLine($"--- [t={Clock.ElapsedMilliseconds}ms] Sending {ClientToServerPayload.Length}-byte client->server test payload ---");
+                await clientStream.WriteAsync(ClientToServerPayload, dataCts.Token).ConfigureAwait(false);
+
+                var response = await ReadExactAsync(clientStream, ServerToClientPayload.Length, dataCts.Token).ConfigureAwait(false);
+                clientReceivedResponse = response is not null && response.AsSpan().SequenceEqual(ServerToClientPayload);
+                dataTestDetail = response is null
+                    ? "FAILED - client never received the full server->client response (connection closed/timed out)."
+                    : $"client received {response.Length} byte(s) back; matches expected response payload = {clientReceivedResponse}.";
+                Console.WriteLine($"    [t={Clock.ElapsedMilliseconds}ms] {dataTestDetail}");
+            }
+            catch (Exception ex)
+            {
+                dataTestDetail = $"FAILED with {ex.GetType().Name}: {ex.Message}";
+                Console.WriteLine($"    [t={Clock.ElapsedMilliseconds}ms] Client-side DATA exchange {dataTestDetail}");
+            }
+        }
+
+        // Give the listener's own DATA-exchange logic (AcceptLoopAsync) a
+        // brief grace period to finish and report its own verdict.
+        var listenerDataOutcome = await Task.WhenAny(dataOutcomeTcs.Task, Task.Delay(TimeSpan.FromSeconds(2)))
+            .ContinueWith(_ => dataOutcomeTcs.Task.IsCompletedSuccessfully ? dataOutcomeTcs.Task.Result : (DataTestOutcome?)null);
+
+        await Task.Delay(500);
 
         // ---- Tear down ------------------------------------------------------
         captureCts.Cancel();
@@ -208,31 +262,69 @@ internal static class Program
         Console.WriteLine($"    forwardCaptures={Interlocked.Read(ref _forwardCount)}, returnCaptures={Interlocked.Read(ref _returnCount)}, reinjected={Interlocked.Read(ref _reinjectedCount)}, sendFailures={Interlocked.Read(ref _sendFailureCount)}");
         Console.WriteLine($"    Local listener accepted a connection: {(acceptedEndpoint is not null ? $"YES, apparent peer {acceptedEndpoint}" : "NO")}");
         Console.WriteLine($"    connect() outcome: {connectDetail}");
+        Console.WriteLine($"    DATA test - listener received client's payload correctly: {listenerDataOutcome?.ClientToServerOk ?? false}");
+        Console.WriteLine($"    DATA test - client received listener's response correctly: {clientReceivedResponse}");
+        Console.WriteLine($"    DATA test detail (client side): {dataTestDetail}");
 
-        var pass = connected && acceptedEndpoint is not null;
+        var handshakePass = connected && acceptedEndpoint is not null;
+        var dataPass = handshakePass && (listenerDataOutcome?.ClientToServerOk ?? false) && clientReceivedResponse;
+        var pass = handshakePass && dataPass;
+
         Console.WriteLine();
         Console.WriteLine(pass
-            ? "=== OVERALL RESULT: PASS - single-handle streamdump-style reflection established a real TCP handshake. ==="
-            : "=== OVERALL RESULT: FAIL - the handshake did not complete (or took the whole timeout) even with the minimal, isolated, official-algorithm single-handle test. ===");
+            ? "=== OVERALL RESULT: PASS - single-handle streamdump-style reflection established a real TCP handshake AND carried bidirectional payload data correctly. ==="
+            : handshakePass
+                ? "=== OVERALL RESULT: FAIL - the 3-way handshake completed, but bidirectional DATA transfer over the established, reflected flow did NOT. ==="
+                : "=== OVERALL RESULT: FAIL - the handshake did not complete (or took the whole timeout) even with the minimal, isolated, official-algorithm single-handle test. ===");
         Console.WriteLine();
-        Console.WriteLine(pass
-            ? "    INTERPRETATION: since basic WinDivert reflection works fine in isolation, the bug is most"
-            : "    INTERPRETATION: since even this minimal, single-handle, flow-table-free, relay-free test");
-        Console.WriteLine(pass
-            ? "    likely specific to Residential Connect's own two-handle/flow-table/relay/CONNECT"
-            : "    reproduces the failure, focus next on address metadata (Network.IfIdx/SubIfIdx), checksum");
-        Console.WriteLine(pass
-            ? "    architecture, not to the fundamental reflection technique itself."
-            : "    flags, the P/Invoke ABI, or how Windows Filtering Platform/this NIC treats reflected");
-        if (!pass)
+
+        if (pass)
         {
-            Console.WriteLine("    packets on this specific machine - NOT the proxy/relay layer.");
+            Console.WriteLine("    INTERPRETATION: since basic WinDivert reflection carries BOTH the handshake and");
+            Console.WriteLine("    established-flow payload data correctly in isolation, the bug is most likely specific");
+            Console.WriteLine("    to Residential Connect's own two-handle/flow-table/relay/CONNECT architecture (e.g.");
+            Console.WriteLine("    TransparentForwardingProxy's stream-relay/tunnel-handoff logic) - NOT to the");
+            Console.WriteLine("    fundamental packet-reflection technique itself, even for established-flow data.");
+        }
+        else if (handshakePass)
+        {
+            Console.WriteLine("    INTERPRETATION: the handshake alone is NOT the problem (it completed correctly), but");
+            Console.WriteLine("    basic single-handle reflection FAILS to carry established-flow DATA packets in at least");
+            Console.WriteLine("    one direction, even in this completely isolated, relay-free, flow-table-free test.");
+            Console.WriteLine("    This points AWAY FROM TransparentForwardingProxy/the stream relay/the upstream tunnel");
+            Console.WriteLine("    handoff and squarely AT established-flow packet reflection itself - e.g. whether a");
+            Console.WriteLine("    pure-ACK-carrying-data (PSH) packet with a non-empty TCP payload is captured/reflected");
+            Console.WriteLine("    identically to the SYN/SYN-ACK/ACK packets that already work, or whether checksum");
+            Console.WriteLine("    recalculation/Network.IfIdx handling behaves differently once a packet carries a");
+            Console.WriteLine("    payload.");
+        }
+        else
+        {
+            Console.WriteLine("    INTERPRETATION: since even this minimal, single-handle, flow-table-free, relay-free");
+            Console.WriteLine("    test reproduces the handshake failure, focus next on address metadata");
+            Console.WriteLine("    (Network.IfIdx/SubIfIdx), checksum flags, the P/Invoke ABI, or how Windows Filtering");
+            Console.WriteLine("    Platform/this NIC treats reflected packets on this specific machine - NOT the");
+            Console.WriteLine("    proxy/relay layer.");
         }
 
         return pass ? 0 : 1;
     }
 
-    private static async Task AcceptLoopAsync(TcpListener listener, TaskCompletionSource<IPEndPoint?> firstAccepted, CancellationToken cancellationToken)
+    /// <summary>
+    /// Accepts the single reflected connection and then performs the
+    /// 2026-09-16 DATA-transfer extension: reads the client's fixed test
+    /// payload, verifies it byte-for-byte, sends back a fixed response
+    /// payload, and reports whether the client is expected to have received
+    /// it verbatim (verified independently in <c>Main</c> via
+    /// <paramref name="dataOutcome"/>). This is the "server"/"PROXY" side of
+    /// the reflected flow, exactly like <c>TransparentForwardingProxy</c>'s
+    /// listener role in production.
+    /// </summary>
+    private static async Task AcceptLoopAsync(
+        TcpListener listener,
+        TaskCompletionSource<IPEndPoint?> firstAccepted,
+        TaskCompletionSource<DataTestOutcome> dataOutcome,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -242,9 +334,39 @@ internal static class Program
                 var peer = (IPEndPoint?)client.Client.RemoteEndPoint;
                 Console.WriteLine($"    [t={Clock.ElapsedMilliseconds}ms] [LOCAL-LISTENER] Accepted a connection - apparent peer (should look like the real target): {peer}");
                 firstAccepted.TrySetResult(peer);
-                // Nothing further to do - this test only proves the 3-way
-                // handshake completes; it deliberately does not relay any
-                // application-layer bytes (no HTTP CONNECT, no proxy).
+
+                try
+                {
+                    var stream = client.GetStream();
+
+                    var received = await ReadExactAsync(stream, ClientToServerPayload.Length, cancellationToken).ConfigureAwait(false);
+                    var receivedOk = received is not null && received.AsSpan().SequenceEqual(ClientToServerPayload);
+                    Console.WriteLine(
+                        $"    [t={Clock.ElapsedMilliseconds}ms] [LOCAL-LISTENER] client->server payload: " +
+                        (received is null
+                            ? "FAILED to read (connection closed/timed out before the full payload arrived)."
+                            : $"received {received.Length} byte(s), matches expected test payload = {receivedOk}."));
+
+                    if (!receivedOk)
+                    {
+                        dataOutcome.TrySetResult(new DataTestOutcome(ClientToServerOk: false, ServerToClientOk: false));
+                        return;
+                    }
+
+                    await stream.WriteAsync(ServerToClientPayload, cancellationToken).ConfigureAwait(false);
+                    Console.WriteLine($"    [t={Clock.ElapsedMilliseconds}ms] [LOCAL-LISTENER] sent {ServerToClientPayload.Length}-byte response payload to client.");
+
+                    dataOutcome.TrySetResult(new DataTestOutcome(ClientToServerOk: true, ServerToClientOk: true));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"    [t={Clock.ElapsedMilliseconds}ms] [LOCAL-LISTENER] DATA exchange failed: {ex.GetType().Name}: {ex.Message}");
+                    dataOutcome.TrySetResult(new DataTestOutcome(ClientToServerOk: false, ServerToClientOk: false));
+                }
+
+                // Only one flow is expected in this single-target-flow tool -
+                // nothing further to accept once the data test has run.
+                return;
             }
         }
         catch (OperationCanceledException)
@@ -253,6 +375,38 @@ internal static class Program
         catch (ObjectDisposedException)
         {
         }
+    }
+
+    /// <summary>Reads exactly <paramref name="length"/> bytes, or returns null on EOF/cancellation before that many bytes arrived.</summary>
+    private static async Task<byte[]?> ReadExactAsync(NetworkStream stream, int length, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[length];
+        var offset = 0;
+        try
+        {
+            while (offset < length)
+            {
+                var read = await stream.ReadAsync(buffer.AsMemory(offset, length - offset), cancellationToken).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    return null;
+                }
+
+                offset += read;
+            }
+
+            return buffer;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Outcome of the 2026-09-16 bidirectional DATA-transfer extension test.</summary>
+    private readonly record struct DataTestOutcome(bool ClientToServerOk, bool ServerToClientOk)
+    {
+        public bool Pass => ClientToServerOk && ServerToClientOk;
     }
 
     private static unsafe void CaptureLoop(IntPtr handle, IPAddress targetIp, int targetPort, int localPort, CancellationToken cancellationToken)
@@ -310,12 +464,24 @@ internal static class Program
         var dstPort = NativePortToHost(tcp->DstPort);
         var seq = BinaryPrimitives.ReverseEndianness(tcp->SeqNum);
         var ack = BinaryPrimitives.ReverseEndianness(tcp->AckNum);
+        var window = BinaryPrimitives.ReverseEndianness(tcp->Window);
         var beforeIpChecksum = ip->Checksum;
         var beforeTcpChecksum = tcp->Checksum;
 
+        // Payload length (2026-09-16 DATA-test addition): total IP length
+        // minus IP header minus TCP header, both read directly off THIS
+        // packet's own header fields - see production's identical
+        // calculation in WinDivertSystemTrafficRouter.CapturePacket, added
+        // for exactly the same reason (distinguishing pure handshake
+        // packets from established-flow DATA segments in the log).
+        var tcpHeaderLengthBytes = ((tcp->HeaderLengthAndFlags & 0x00F0) >> 4) * 4;
+        var ipTotalLength = BinaryPrimitives.ReverseEndianness(ip->Length);
+        var ipHeaderLengthBytes = ip->HeaderLength * 4;
+        var payloadLength = Math.Max(0, ipTotalLength - ipHeaderLengthBytes - tcpHeaderLengthBytes);
+
         Console.WriteLine(
             $"    [t={Clock.ElapsedMilliseconds}ms] CAPTURED {srcAddr}:{srcPort} -> {dstAddr}:{dstPort} " +
-            $"flags=[{DescribeFlags(tcp)}] seq={seq} ack={ack} " +
+            $"flags=[{DescribeFlags(tcp)}] seq={seq} ack={ack} window={window} payloadLen={payloadLength} " +
             $"Outbound={address->Outbound} Loopback={address->Loopback} Impostor={address->Impostor} " +
             $"IPChecksumValid={address->IPChecksumValid} TCPChecksumValid={address->TCPChecksumValid} " +
             $"IfIdx={address->IfIdx} SubIfIdx={address->SubIfIdx} " +
@@ -402,11 +568,12 @@ internal static class Program
 
     private static unsafe string DescribeFlags(WinDivertNative.TcpHeader* tcp)
     {
-        var flags = new List<string>(4);
+        var flags = new List<string>(5);
         if (tcp->Syn) flags.Add("SYN");
         if (tcp->Ack) flags.Add("ACK");
         if (tcp->Fin) flags.Add("FIN");
         if (tcp->Rst) flags.Add("RST");
+        if (tcp->Psh) flags.Add("PSH");
         return flags.Count == 0 ? "-" : string.Join(",", flags);
     }
 

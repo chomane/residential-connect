@@ -590,7 +590,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionBefore = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore} Impostor={address->Impostor}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [FORWARD #{captureNumber}] {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore} Impostor={address->Impostor} {DescribeTcpDataFields(captured)}");
         }
 
         var decision = PacketRedirectPlanner.PlanForward(captured, _flowTable, relayPort, _failClosed);
@@ -629,7 +629,7 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         if (_diagnosticsEnabled)
         {
             var directionBefore = address->Outbound ? "Outbound" : "Inbound";
-            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore} Impostor={address->Impostor}");
+            _logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] [RETURN #{captureNumber}] relay reply captured {captured.SrcAddr}:{captured.SrcPort} -> {captured.DstAddr}:{captured.DstPort} flags=[{DescribeTcpFlags(captured)}] direction-before={directionBefore} Impostor={address->Impostor} {DescribeTcpDataFields(captured)}");
         }
 
         var decision = PacketRedirectPlanner.PlanReturn(captured, _flowTable, _failClosed);
@@ -654,20 +654,40 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
         RecalculateAndSend(handle, packetBuffer, recvLen, address, "return", captured, captureNumber);
     }
 
-    /// <summary>Renders which of SYN/ACK/FIN/RST are set on a captured packet, for diagnostic logging only.</summary>
+    /// <summary>Renders which of SYN/ACK/FIN/RST/PSH are set on a captured packet, for diagnostic logging only.</summary>
     private static string DescribeTcpFlags(CapturedTcpPacket packet)
     {
-        var flags = new List<string>(4);
+        var flags = new List<string>(5);
         if (packet.IsSyn) flags.Add("SYN");
         if (packet.IsAck) flags.Add("ACK");
         if (packet.IsFin) flags.Add("FIN");
         if (packet.IsRst) flags.Add("RST");
+        if (packet.IsPsh) flags.Add("PSH");
         return flags.Count == 0 ? "-" : string.Join(",", flags);
     }
+
+    /// <summary>
+    /// Renders the extra diagnostic-only fields added 2026-09-16 (sequence
+    /// number, ACK number, receive window, and TCP payload length) as a
+    /// single string, for the "established-flow data transfer" investigation
+    /// - see <see cref="CapturedTcpPacket"/>'s remarks. Deliberately never
+    /// includes the payload BYTES themselves, only its length.
+    /// </summary>
+    private static string DescribeTcpDataFields(CapturedTcpPacket packet) =>
+        $"seq={packet.SeqNum} ack={packet.AckNum} window={packet.Window} payloadLen={packet.PayloadLength}";
 
     private static unsafe CapturedTcpPacket CapturePacket(WinDivertNative.IPv4Header* ip, WinDivertNative.TcpHeader* tcp)
     {
         var tcpFlags = tcp->HeaderLengthAndFlags;
+
+        // Data offset (TCP header length in 32-bit words) occupies the high
+        // nibble of the LOW byte of this little-endian-read ushort - see the
+        // long-form byte-order explanation on CapturedTcpPacket's remarks.
+        var tcpHeaderLengthBytes = ((tcpFlags & 0x00F0) >> 4) * 4;
+        var ipTotalLength = BinaryPrimitives.ReverseEndianness(ip->Length);
+        var ipHeaderLengthBytes = ip->HeaderLength * 4;
+        var payloadLength = Math.Max(0, ipTotalLength - ipHeaderLengthBytes - tcpHeaderLengthBytes);
+
         return new CapturedTcpPacket(
             IsSyn: (tcpFlags & 0x0200) != 0,
             IsAck: (tcpFlags & 0x1000) != 0,
@@ -676,7 +696,12 @@ public sealed class WinDivertSystemTrafficRouter : ISystemTrafficRouter
             SrcAddr: NativeIpv4ToIPAddress(ip->SrcAddr),
             SrcPort: NativePortToHost(tcp->SrcPort),
             DstAddr: NativeIpv4ToIPAddress(ip->DstAddr),
-            DstPort: NativePortToHost(tcp->DstPort));
+            DstPort: NativePortToHost(tcp->DstPort),
+            IsPsh: (tcpFlags & 0x0800) != 0,
+            SeqNum: BinaryPrimitives.ReverseEndianness(tcp->SeqNum),
+            AckNum: BinaryPrimitives.ReverseEndianness(tcp->AckNum),
+            Window: BinaryPrimitives.ReverseEndianness(tcp->Window),
+            PayloadLength: payloadLength);
     }
 
     /// <summary>

@@ -179,8 +179,14 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
             {
                 if (DiagnosticsEnabled)
                 {
-                    var (bytesAppToUpstream, bytesUpstreamToApp) = await RelayBidirectionalWithByteCountsAsync(localStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
-                    _logger.Debug("RoutingDiagnostics", $"Redirected session to {targetHost}:{targetPort} ended. Bytes app->upstream={bytesAppToUpstream}, upstream->app={bytesUpstreamToApp}. (Payload contents and credentials are never logged.)");
+                    var sessionLabel = $"[SESSION {clientEndpoint} -> {targetHost}:{targetPort}]";
+                    var outcome = await RelayBidirectionalWithDiagnosticsAsync(localStream, upstream.GetStream(), _logger, sessionLabel, cancellationToken).ConfigureAwait(false);
+                    _logger.Debug(
+                        "RoutingDiagnostics",
+                        $"[t={DiagnosticClock.ElapsedMs}ms] Redirected session to {targetHost}:{targetPort} ended. " +
+                        $"First-completed direction=\"{outcome.FirstCompletedDirection}\" ({outcome.FirstCompletedReason}). " +
+                        $"Bytes app->upstream={outcome.BytesAppToUpstream}, upstream->app={outcome.BytesUpstreamToApp}. " +
+                        "(Payload contents and credentials are never logged.)");
                 }
                 else
                 {
@@ -203,44 +209,137 @@ public sealed class TransparentForwardingProxy : ITransparentForwardingProxy
     }
 
     /// <summary>
-    /// Diagnostic-only variant of <see cref="UpstreamRelayHelper.RelayBidirectionalAsync"/>
-    /// that additionally counts bytes copied in each direction, WITHOUT ever
-    /// logging or returning the actual payload bytes/content. Only used when
-    /// <see cref="DiagnosticsEnabled"/> is true.
+    /// Outcome of one diagnostic-instrumented bidirectional relay session -
+    /// see <see cref="RelayBidirectionalWithDiagnosticsAsync"/>. Deliberately
+    /// contains only byte COUNTS and completion metadata, never payload
+    /// bytes or credentials.
     /// </summary>
-    private static async Task<(long BytesAToB, long BytesBToA)> RelayBidirectionalWithByteCountsAsync(NetworkStream a, NetworkStream b, CancellationToken cancellationToken)
-    {
-        long bytesAToB = 0;
-        long bytesBToA = 0;
+    private readonly record struct RelayOutcome(
+        long BytesAppToUpstream,
+        long BytesUpstreamToApp,
+        string FirstCompletedDirection,
+        string FirstCompletedReason);
 
-        async Task CopyCountingAsync(NetworkStream from, NetworkStream to, Action<long> addBytes)
+    /// <summary>
+    /// Diagnostic-only variant of <see cref="UpstreamRelayHelper.RelayBidirectionalAsync"/>,
+    /// added 2026-09-16 to investigate the "upstream CONNECT returned 200,
+    /// but the redirected session immediately ended with zero bytes in both
+    /// directions" symptom (see this class's own diagnostic log line right
+    /// after this method's call site, and <c>UpstreamRelayHelper</c>'s
+    /// remarks on the underlying <c>Task.WhenAny</c> pattern this method
+    /// shares with production). Only used when <see cref="DiagnosticsEnabled"/>
+    /// is true; the non-diagnostic path (<see cref="UpstreamRelayHelper.RelayBidirectionalAsync"/>)
+    /// is completely unchanged and used as-is when diagnostics are off.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Logs, for EACH direction independently: the moment its pump starts,
+    /// its first <c>ReadAsync</c> result (including explicitly flagging an
+    /// immediate EOF - <c>ReadAsync</c> returning 0 on the very first call),
+    /// every EOF observed, its first successful <c>WriteAsync</c> byte
+    /// count, and the exact exception type/message (never the payload) if
+    /// the pump ends via an exception rather than a clean EOF. It then logs
+    /// which of the two directions' pumps completed FIRST and why (EOF /
+    /// cancelled / exception) - this is the exact question needed to
+    /// determine whether the client ever sent ANY post-handshake bytes at
+    /// all (a WinDivert established-flow-reflection problem) versus the
+    /// upstream tunnel closing first (an upstream/proxy-side problem).
+    /// </para>
+    /// <para>
+    /// <b>Never logs payload contents or credentials</b> - only byte counts,
+    /// direction labels, exception types/messages, and timestamps.
+    /// </para>
+    /// </remarks>
+    private static async Task<RelayOutcome> RelayBidirectionalWithDiagnosticsAsync(
+        NetworkStream appStream,
+        NetworkStream upstreamStream,
+        IAppLogger logger,
+        string sessionLabel,
+        CancellationToken cancellationToken)
+    {
+        long bytesAppToUpstream = 0;
+        long bytesUpstreamToApp = 0;
+
+        async Task<string> PumpAsync(string directionLabel, NetworkStream from, NetworkStream to, Action<long> addBytes)
         {
+            logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} [{directionLabel}] pump starting.");
+
             var buffer = new byte[81920];
+            var firstReadLogged = false;
+            long cumulative = 0;
+
             try
             {
                 while (true)
                 {
                     var read = await from.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+
+                    if (!firstReadLogged)
+                    {
+                        firstReadLogged = true;
+                        logger.Debug(
+                            "RoutingDiagnostics",
+                            $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} [{directionLabel}] first ReadAsync returned {read} byte(s)" +
+                            (read == 0 ? " - IMMEDIATE EOF (no data was ever read on this direction)." : "."));
+                    }
+
                     if (read == 0)
                     {
-                        break;
+                        logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} [{directionLabel}] EOF (ReadAsync returned 0). Cumulative bytes this direction={cumulative}.");
+                        return $"EOF, cumulative={cumulative}";
                     }
 
                     addBytes(read);
+                    var isFirstWrite = cumulative == 0;
+                    cumulative += read;
+
                     await to.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+
+                    if (isFirstWrite)
+                    {
+                        logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} [{directionLabel}] first WriteAsync wrote {read} byte(s) onward.");
+                    }
                 }
             }
-            catch
+            catch (OperationCanceledException)
             {
-                // Connection closed by either side - normal end-of-session.
+                logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} [{directionLabel}] CANCELLED. Cumulative bytes this direction={cumulative}.");
+                return $"cancelled, cumulative={cumulative}";
+            }
+            catch (Exception ex)
+            {
+                logger.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} [{directionLabel}] ended via {ex.GetType().Name} (\"{ex.Message}\"). Cumulative bytes this direction={cumulative}.");
+                return $"{ex.GetType().Name}, cumulative={cumulative}";
             }
         }
 
-        var t1 = CopyCountingAsync(a, b, n => Interlocked.Add(ref bytesAToB, n));
-        var t2 = CopyCountingAsync(b, a, n => Interlocked.Add(ref bytesBToA, n));
-        await Task.WhenAny(t1, t2).ConfigureAwait(false);
+        // NOTE: this Task.WhenAny pattern is shared with production's
+        // UpstreamRelayHelper.RelayBidirectionalAsync - see that class's
+        // remarks for the full analysis of what it actually does (it
+        // returns control to the caller - which then disposes BOTH streams
+        // - the instant the FIRST of the two directions completes, whether
+        // by clean EOF, cancellation, or exception; the other, still-running
+        // direction's pump is not awaited or given any grace period here -
+        // it gets torn down by the caller's stream disposal shortly after
+        // this method returns).
+        var appToUpstreamTask = PumpAsync("app->upstream", appStream, upstreamStream, n => Interlocked.Add(ref bytesAppToUpstream, n));
+        var upstreamToAppTask = PumpAsync("upstream->app", upstreamStream, appStream, n => Interlocked.Add(ref bytesUpstreamToApp, n));
 
-        return (Interlocked.Read(ref bytesAToB), Interlocked.Read(ref bytesBToA));
+        var firstCompletedTask = await Task.WhenAny(appToUpstreamTask, upstreamToAppTask).ConfigureAwait(false);
+        var firstCompletedReason = await firstCompletedTask.ConfigureAwait(false);
+        var firstCompletedDirection = firstCompletedTask == appToUpstreamTask ? "app->upstream" : "upstream->app";
+
+        logger.Debug(
+            "RoutingDiagnostics",
+            $"[t={DiagnosticClock.ElapsedMs}ms] {sessionLabel} direction \"{firstCompletedDirection}\" completed FIRST ({firstCompletedReason}). " +
+            "Per the Task.WhenAny relay pattern (see UpstreamRelayHelper remarks), the redirected session is now torn down " +
+            "by the caller even if the OTHER direction's pump was still running.");
+
+        return new RelayOutcome(
+            Interlocked.Read(ref bytesAppToUpstream),
+            Interlocked.Read(ref bytesUpstreamToApp),
+            firstCompletedDirection,
+            firstCompletedReason);
     }
 
     /// <summary>
