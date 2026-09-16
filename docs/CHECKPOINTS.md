@@ -96,3 +96,93 @@ handles, new filter-builder methods, new diagnostic steps - never a
 modification of the TCP reflection/redirect/relay logic above, unless a new
 real-Windows diagnostic run produces contradicting evidence and this
 checkpoint is explicitly revised (with the new evidence recorded here).
+
+---
+
+## WHOLE COMPUTER V0.2 VERIFIED — commit `a686b4bf9a0c10c08b378a4c56b98cb9f0a54f32` (2026-09-16)
+
+**Status: Whole Computer (V0.2) is VERIFIED end-to-end on real Windows
+10/11 x64 hardware for TCP proxying AND fail-closed UDP/DNS/QUIC leak
+protection**, superseding the TCP-only checkpoint above with a full-scope
+result. This is the acceptance run of
+`tools/ResidentialConnect.RoutingDiagnostic` at commit `a686b4b` - the
+same build that added the raw UDP/53 DNS probe, the HTTP/3 (QUIC/UDP-443)
+probe, and the `=== ACCEPTANCE SUMMARY ===` banner on top of the
+already-verified TCP reflection pipeline.
+
+### Real-Windows acceptance evidence
+
+A real-Windows run of `tools/ResidentialConnect.RoutingDiagnostic` at
+commit `a686b4b` produced the following final acceptance summary, with
+every required result independently PASS:
+
+| Check | Result |
+|---|---|
+| TCP through residential proxy | **PASS** |
+| Proxy egress verification (IP changed) | **PASS** |
+| UDP/53 (DNS) leak block while Active | **PASS** |
+| QUIC/UDP-443 (HTTP/3) leak block while Active | **PASS** |
+| UDP restoration after disconnect | **PASS** |
+| TCP restoration after disconnect | **PASS** |
+
+Final diagnostic line: **`=== OVERALL RESULT: PASS`** - all six
+independently-reported acceptance-summary results passed, including the
+QUIC/UDP-443 check reaching a real PASS (not a SKIP) on this test machine,
+i.e. HTTP/3 was genuinely attemptable there and was confirmed blocked
+while Active, not merely reported unavailable.
+
+This confirms, on real hardware, everything the TCP-only checkpoint above
+already established (redirected HTTPS via reflection, egress IP change,
+clean restore on disconnect) **plus**:
+
+- The DNS-block WinDivert Drop handle (`BypassFilterBuilder.BuildDnsFilter`
+  / `DnsLeakGuard`) actually prevents a real raw UDP/53 DNS query from
+  leaving the machine while Active (no response received), and that same
+  query works normally again immediately after `StopAsync()`.
+- The general UDP-block WinDivert Drop handle
+  (`BypassFilterBuilder.BuildUdpBlockFilter`) actually prevents a real
+  HTTP/3 (QUIC, UDP/443) request from completing while Active on a machine
+  where HTTP/3 is genuinely attemptable (`QuicConnection.IsSupported ==
+  true`), closing the gap the prior UDP-block commit (`8d8170f`) left
+  unverified ("this still only exercises the TCP acceptance path").
+
+### What this checkpoint covers (in addition to the TCP-only checkpoint above)
+
+1. Everything listed under "TCP VERIFIED — `145c130`" above, now
+   reconfirmed as still working unmodified at `a686b4b`.
+2. The DNS-block Drop handle's real-world leak-prevention effect (not just
+   its filter string) - `BypassFilterBuilder.BuildDnsFilter`,
+   `DnsLeakGuard`.
+3. The general UDP-block Drop handle's real-world leak-prevention effect -
+   `BypassFilterBuilder.BuildUdpBlockFilter`, and its wiring as a fourth
+   WinDivert handle in `WinDivertSystemTrafficRouter`.
+4. Clean, complete restoration of both UDP (DNS) and TCP direct networking
+   on `StopAsync()`.
+5. `tools/ResidentialConnect.RoutingDiagnostic`'s own new UDP/DNS/QUIC
+   acceptance steps and `RawDnsProbeMessage` probe helper as the diagnostic
+   instrumentation that produced this evidence.
+
+### Files that implement this VERIFIED behavior (do not modify without new real-Windows evidence)
+
+All files listed under "TCP VERIFIED — `145c130`" above, **plus**:
+
+- `src/ResidentialConnect.Routing/BypassFilterBuilder.cs` -
+  `BuildDnsFilter` (unchanged since the prior checkpoint) and
+  `BuildUdpBlockFilter` (new, additive).
+- `src/ResidentialConnect.Routing/DnsLeakGuard.cs` - the DNS-block policy
+  documentation class.
+- `src/ResidentialConnect.Routing/WinDivertSystemTrafficRouter.cs` - the
+  `_udpBlockHandle` fourth-handle wiring (`OpenHandleOrThrow`,
+  `ShutdownReceive`, `CloseHandle` lifecycle calls for it), in addition to
+  the TCP forward/return logic already covered above.
+- `src/ResidentialConnect.Routing/RawDnsProbeMessage.cs` - the pure
+  raw-DNS query/response probe helper used by the diagnostic tool's new
+  UDP/53 checks.
+- `tools/ResidentialConnect.RoutingDiagnostic/Program.cs` - the full
+  acceptance sequence (TCP + UDP/DNS + QUIC steps and the
+  `=== ACCEPTANCE SUMMARY ===` banner) that produced this evidence.
+
+**This is now the standing baseline for all further Whole Computer mode
+work.** Any future change must be strictly additive to the files listed
+above (both checkpoints combined) unless a new real-Windows diagnostic run
+produces contradicting evidence and this checkpoint is explicitly revised.
