@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Windows;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Common;
@@ -16,12 +18,15 @@ namespace ResidentialConnect.Client;
 /// </summary>
 public partial class MainWindow : Window
 {
+    private const string WholeComputerLaunchArgument = "--whole-computer";
+
     private readonly IProxyRepository _repository;
     private readonly IConnectionManager _connectionManager;
     private readonly IBrowserLauncher _browserLauncher;
     private readonly ISystemTrafficRouter? _trafficRouter;
 
     private ProxyProfile? _selectedProfile;
+    private bool _isHandlingElevation;
 
     public MainWindow(
         IProxyRepository repository,
@@ -38,6 +43,15 @@ public partial class MainWindow : Window
         _connectionManager.StateChanged += (_, state) => Dispatcher.Invoke(() => RenderState(state));
 
         ReloadProxies();
+
+        if (OperatingSystem.IsWindows() &&
+            Environment.GetCommandLineArgs().Any(arg =>
+                string.Equals(arg, WholeComputerLaunchArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            BrowserOnlyRadio.IsChecked = false;
+            WholeComputerRadio.IsChecked = true;
+        }
+
         UpdateModeHint();
     }
 
@@ -88,7 +102,7 @@ public partial class MainWindow : Window
         // DISCONNECT first (see docs/ARCHITECTURE.md "Mode switching").
         var modeLocked = state.Status is ConnectionStatus.Connected or ConnectionStatus.Connecting or ConnectionStatus.Disconnecting;
         BrowserOnlyRadio.IsEnabled = !modeLocked;
-        WholeComputerRadio.IsEnabled = !modeLocked && (_trafficRouter?.IsSupported ?? false);
+        WholeComputerRadio.IsEnabled = !modeLocked && OperatingSystem.IsWindows();
 
         if (state.Mode == ConnectionMode.WholeComputer && state.RoutingStatus == SystemRoutingStatus.FailedClosed)
         {
@@ -102,6 +116,15 @@ public partial class MainWindow : Window
 
     private void ModeRadio_Checked(object sender, RoutedEventArgs e)
     {
+        if (WholeComputerRadio?.IsChecked == true &&
+            OperatingSystem.IsWindows() &&
+            (_trafficRouter is null || !_trafficRouter.IsSupported) &&
+            !_isHandlingElevation)
+        {
+            TryRelaunchElevatedForWholeComputer();
+            return;
+        }
+
         UpdateModeHint();
     }
 
@@ -122,11 +145,64 @@ public partial class MainWindow : Window
 
         if (_trafficRouter is null || !_trafficRouter.IsSupported)
         {
-            ModeHintText.Text = "Whole Computer mode requires running Residential Connect as Administrator on Windows.";
+            ModeHintText.Text = "Whole Computer mode needs Administrator permission. Windows will ask for permission automatically.";
         }
         else
         {
             ModeHintText.Text = "Whole Computer mode routes TCP applications through the selected residential IP. DNS is securely resolved through the proxy. Unsupported public UDP/QUIC traffic is blocked to prevent direct bypass.";
+        }
+    }
+
+    private void TryRelaunchElevatedForWholeComputer()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        _isHandlingElevation = true;
+
+        try
+        {
+            var executablePath = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                throw new InvalidOperationException("Could not determine the Residential Connect executable path.");
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executablePath,
+                Arguments = WholeComputerLaunchArgument,
+                UseShellExecute = true,
+                Verb = "runas",
+                WorkingDirectory = AppContext.BaseDirectory
+            };
+
+            Process.Start(startInfo);
+            Application.Current.Shutdown();
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            // ERROR_CANCELLED: the user declined the normal Windows UAC prompt.
+            BrowserOnlyRadio.IsChecked = true;
+            WholeComputerRadio.IsChecked = false;
+            UpdateModeHint();
+        }
+        catch (Exception ex)
+        {
+            App.Services.Logger.Error("Elevation", "Failed to relaunch Residential Connect as Administrator.", ex);
+            MessageBox.Show(
+                this,
+                "Windows could not restart Residential Connect as Administrator. You can still use Browser Only mode, or right-click Residential Connect and choose Run as administrator.",
+                "Administrator permission required");
+            BrowserOnlyRadio.IsChecked = true;
+            WholeComputerRadio.IsChecked = false;
+            UpdateModeHint();
+        }
+        finally
+        {
+            _isHandlingElevation = false;
         }
     }
 
@@ -164,10 +240,7 @@ public partial class MainWindow : Window
         var mode = SelectedMode;
         if (mode == ConnectionMode.WholeComputer && (_trafficRouter is null || !_trafficRouter.IsSupported))
         {
-            MessageBox.Show(
-                this,
-                "Whole Computer mode requires running Residential Connect as Administrator on Windows. Restart the app elevated, or use Browser Only mode.",
-                "Whole Computer mode unavailable");
+            TryRelaunchElevatedForWholeComputer();
             return;
         }
 
