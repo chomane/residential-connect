@@ -59,7 +59,7 @@
             </StackPanel>
         </Grid>
 
-        <Button x:Name="OpenBrowserButton" Grid.Row="6" Content="OPEN BROWSER" Height="40" FontSize="14"
+        <Button x:Name="OpenBrowserButton" Grid.Row="6" Content="OPEN SEPARATE BROWSER WITH RESIDENTIAL IP" Height="40" FontSize="14"
                 Click="OpenBrowserButton_Click" Margin="0,10,0,10" IsEnabled="False"/>
 
         <ComboBox x:Name="ProxyComboBox" Grid.Row="7" Height="30" Margin="0,0,0,10"
