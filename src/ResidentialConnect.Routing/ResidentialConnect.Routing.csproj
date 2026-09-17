@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ResidentialConnect.Core\ResidentialConnect.Core.csproj" />
+    <ProjectReference Include="..\ResidentialConnect.Proxy\ResidentialConnect.Proxy.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Ships the official, unmodified WinDivert.dll (user-mode library) and
+      WinDivert64.sys (Windows driver) native binaries for win-x64 next to
+      the published .exe. WinDivert itself is dual-licensed LGPLv3/GPLv2
+      (https://github.com/basil00/WinDivert/blob/master/LICENSE); this
+      package (Native.WinDivert) redistributes those official binaries
+      unmodified - see docs/ARCHITECTURE.md "V0.2: Whole Computer routing"
+      for the licensing note required by LGPLv3 ss4/ss5.
+
+      IMPORTANT: WinDivertNative.cs in this project calls the native API
+      DIRECTLY via P/Invoke rather than through a third-party managed
+      wrapper package. An earlier revision used Aigio.WinDivertSharp, whose
+      WinDivertAddress struct is only 24 bytes; the real WinDivert 2.2.2
+      WINDIVERT_ADDRESS is 80 bytes. That size mismatch is a credible root
+      cause of coreclr.dll access-violation crashes observed during live
+      Windows testing. Do not reintroduce Aigio.WinDivertSharp or any other
+      third-party WinDivert wrapper without re-verifying its native address
+      struct size against whatever WinDivert version is actually bundled -
+      see WinDivertNative.ValidateAbi(), which is called once before any
+      handle is opened specifically to catch this class of bug early.
+    -->
+    <PackageReference Include="Native.WinDivert" Version="2.2.2" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Lets ResidentialConnect.Tests call WinDivertNative.TryCompileFilter
+      directly (on a real Windows machine only - see
+      BypassFilterBuilderTests "..._CompilesAgainstTheRealWinDivertParser"
+      tests, which are runtime-guarded with OperatingSystem.IsWindows() and
+      are no-ops elsewhere) to validate every generated filter string
+      against WinDivert's OWN native parser, not just this project's own
+      assumptions about its grammar - per the explicit instruction "where
+      possible, use WinDivert's filter compilation helper to validate every
+      generated filter string".
+    -->
+    <InternalsVisibleTo Include="ResidentialConnect.Tests" />
+  </ItemGroup>
+
+</Project>

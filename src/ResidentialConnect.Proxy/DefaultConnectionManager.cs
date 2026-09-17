@@ -1,3 +1,4 @@
+using System.Net;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
@@ -5,27 +6,61 @@ using ResidentialConnect.Core.Models;
 namespace ResidentialConnect.Proxy;
 
 /// <summary>
-/// Default <see cref="IConnectionManager"/> for V0.1. "Connecting" means:
-/// run a full <see cref="IProxyConnectivityTester"/> pass against the
-/// selected profile and, if it succeeds, remember it as the active
-/// connection for the UI/OPEN BROWSER flow to reference. This implementation
-/// deliberately does NOT touch the Windows system proxy or route
-/// whole-machine traffic - see
-/// <see cref="Core.Abstractions.Future.ISystemRoutingProvider"/> for where
-/// that would plug in for a future release.
+/// Default <see cref="IConnectionManager"/>. "Connecting" always means: run a
+/// full <see cref="IProxyConnectivityTester"/> pass against the selected
+/// profile first (exactly V0.1's behavior, unconditionally - so Whole
+/// Computer mode gets exactly the same credential/reachability proof Browser
+/// Only mode already relies on) and, only if that succeeds, additionally
+/// start <see cref="ISystemTrafficRouter"/> when <see cref="ConnectionMode.WholeComputer"/>
+/// was requested. <see cref="ConnectionMode.BrowserOnly"/> (the default)
+/// never touches <see cref="ISystemTrafficRouter"/> at all - it is
+/// byte-for-byte the same code path V0.1 shipped with.
 /// </summary>
 public sealed class DefaultConnectionManager : IConnectionManager
 {
     private readonly IProxyConnectivityTester _tester;
+    private readonly ICredentialStore _credentialStore;
+    private readonly ISystemTrafficRouter? _trafficRouter;
+    private readonly IWholeComputerConnectivityVerifier _wholeComputerVerifier;
     private readonly IAppLogger _logger;
     private readonly object _lock = new();
 
     private ConnectionState _currentState = ConnectionState.Idle;
 
-    public DefaultConnectionManager(IProxyConnectivityTester tester, IAppLogger logger)
+    /// <summary>
+    /// <paramref name="trafficRouter"/> is optional specifically so
+    /// Browser-Only-only deployments/tests never need to construct a real
+    /// (Windows-only, elevation-requiring) router at all - passing null means
+    /// Whole Computer mode simply reports <see cref="SystemRoutingStatus.Unavailable"/>
+    /// if ever requested. <paramref name="credentialStore"/> is needed only
+    /// for the Whole Computer path, to resolve the plaintext password
+    /// <see cref="ISystemTrafficRouter.StartAsync"/> needs to build the
+    /// upstream HTTP CONNECT/SOCKS5 tunnel - exactly the same store and the
+    /// same <see cref="ProxyProfile.CredentialRef"/> lookup
+    /// <see cref="HttpProxyConnectivityTester"/> already uses for the
+    /// connectivity test above, kept only in memory for the duration of this
+    /// call, never logged. <paramref name="wholeComputerVerifier"/> defaults
+    /// to a real <see cref="HostnameConnectivityVerifier"/> when omitted so
+    /// existing callers (the WPF composition root) get the correct
+    /// production behavior without having to know this dependency exists;
+    /// tests inject a scriptable fake instead - see
+    /// <see cref="IWholeComputerConnectivityVerifier"/> remarks for why this
+    /// check exists at all (never report Connected before a real,
+    /// hostname-addressed request has been proven to route through Whole
+    /// Computer mode end-to-end).
+    /// </summary>
+    public DefaultConnectionManager(
+        IProxyConnectivityTester tester,
+        ICredentialStore credentialStore,
+        IAppLogger logger,
+        ISystemTrafficRouter? trafficRouter = null,
+        IWholeComputerConnectivityVerifier? wholeComputerVerifier = null)
     {
         _tester = tester ?? throw new ArgumentNullException(nameof(tester));
+        _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _trafficRouter = trafficRouter;
+        _wholeComputerVerifier = wholeComputerVerifier ?? new HostnameConnectivityVerifier(_logger);
     }
 
     public event EventHandler<ConnectionState>? StateChanged;
@@ -35,7 +70,7 @@ public sealed class DefaultConnectionManager : IConnectionManager
         get { lock (_lock) { return _currentState; } }
     }
 
-    public async Task<ConnectionState> ConnectAsync(ProxyProfile profile, CancellationToken cancellationToken = default)
+    public async Task<ConnectionState> ConnectAsync(ProxyProfile profile, ConnectionMode mode = ConnectionMode.BrowserOnly, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(profile);
 
@@ -43,46 +78,338 @@ public sealed class DefaultConnectionManager : IConnectionManager
         {
             Status = ConnectionStatus.Connecting,
             ActiveProxy = profile,
-            StatusMessage = "Connecting..."
+            Mode = mode,
+            StatusMessage = mode == ConnectionMode.WholeComputer ? "Connecting (Whole Computer)..." : "Connecting..."
         });
 
-        _logger.Info("ConnectionManager", $"CONNECT requested for '{profile.Name}'.");
+        _logger.Info("ConnectionManager", $"CONNECT requested for '{profile.Name}' (mode={mode}).");
 
         var result = await _tester.TestAsync(profile, cancellationToken).ConfigureAwait(false);
 
-        ConnectionState newState;
-        if (result.Success)
+        if (!result.Success)
         {
-            newState = new ConnectionState
+            var failedState = new ConnectionState
+            {
+                Status = ConnectionStatus.Error,
+                ActiveProxy = profile,
+                Mode = mode,
+                StatusMessage = result.Message ?? "Connection failed."
+            };
+            _logger.Warning("ConnectionManager", $"Connect failed for '{profile.Name}': {result.FailureReason} - {result.Message}");
+            SetState(failedState);
+            return failedState;
+        }
+
+        _logger.Info("ConnectionManager", $"Proxy connectivity verified for '{profile.Name}'. Latency={result.Latency?.TotalMilliseconds:0}ms.");
+
+        if (mode != ConnectionMode.WholeComputer)
+        {
+            var connectedState = new ConnectionState
             {
                 Status = ConnectionStatus.Connected,
                 ActiveProxy = profile,
+                Mode = ConnectionMode.BrowserOnly,
+                RoutingStatus = SystemRoutingStatus.Disabled,
                 PublicIp = result.ObservedPublicIp,
                 Latency = result.Latency,
                 StatusMessage = "Connected"
             };
-            _logger.Info("ConnectionManager", $"Connected via '{profile.Name}'. Latency={result.Latency?.TotalMilliseconds:0}ms.");
+            SetState(connectedState);
+            return connectedState;
         }
-        else
+
+        // Whole Computer requested: connectivity is proven, now arm
+        // whole-computer routing. If this fails for any reason, the CONNECT
+        // attempt as a whole is reported as failed - Whole Computer mode
+        // never "partially" succeeds by silently falling back to Browser
+        // Only (that would defeat the fail-closed contract at the UX level).
+        if (_trafficRouter is null)
         {
-            newState = new ConnectionState
+            var noRouterState = new ConnectionState
             {
                 Status = ConnectionStatus.Error,
                 ActiveProxy = profile,
-                StatusMessage = result.Message ?? "Connection failed."
+                Mode = ConnectionMode.WholeComputer,
+                RoutingStatus = SystemRoutingStatus.Unavailable,
+                StatusMessage = "Whole Computer mode is not available on this build/platform."
             };
-            _logger.Warning("ConnectionManager", $"Connect failed for '{profile.Name}': {result.FailureReason} - {result.Message}");
+            _logger.Warning("ConnectionManager", "Whole Computer requested but no ISystemTrafficRouter was configured.");
+            SetState(noRouterState);
+            return noRouterState;
         }
 
-        SetState(newState);
-        return newState;
+        if (!_trafficRouter.IsSupported)
+        {
+            var unsupportedState = new ConnectionState
+            {
+                Status = ConnectionStatus.Error,
+                ActiveProxy = profile,
+                Mode = ConnectionMode.WholeComputer,
+                RoutingStatus = SystemRoutingStatus.Unavailable,
+                StatusMessage = "Whole Computer mode requires running Residential Connect as Administrator on Windows."
+            };
+            _logger.Warning("ConnectionManager", "Whole Computer requested but ISystemTrafficRouter.IsSupported is false (not elevated / not Windows).");
+            SetState(unsupportedState);
+            return unsupportedState;
+        }
+
+        var password = _credentialStore.Retrieve(profile.CredentialRef);
+        if (string.IsNullOrEmpty(password))
+        {
+            // Should not happen - the connectivity test above already
+            // required a stored password to succeed - but fail closed
+            // explicitly rather than ever calling StartAsync with an empty
+            // credential.
+            var noPasswordState = new ConnectionState
+            {
+                Status = ConnectionStatus.Error,
+                ActiveProxy = profile,
+                Mode = ConnectionMode.WholeComputer,
+                RoutingStatus = SystemRoutingStatus.Unavailable,
+                StatusMessage = "No stored password found for this proxy."
+            };
+            _logger.Warning("ConnectionManager", $"Whole Computer requested for '{profile.Name}' but no stored credential was found.");
+            SetState(noPasswordState);
+            return noPasswordState;
+        }
+
+        // Subscribe once per CONNECT so a later, asynchronous fail-closed
+        // transition (the upstream tunnel/relay faulting while already
+        // Active) is reflected into ConnectionState/StateChanged for the UI,
+        // without the UI needing to know ISystemTrafficRouter exists at all.
+        _trafficRouter.StatusChanged += OnRoutingStatusChanged;
+
+        SystemRoutingStatus routingStatus;
+        try
+        {
+            routingStatus = await _trafficRouter.StartAsync(profile, password, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("ConnectionManager", "ISystemTrafficRouter.StartAsync threw unexpectedly - treating as Unavailable (fail-closed).", ex);
+            routingStatus = SystemRoutingStatus.Unavailable;
+        }
+
+        if (routingStatus != SystemRoutingStatus.Active)
+        {
+            _trafficRouter.StatusChanged -= OnRoutingStatusChanged;
+            var failedRoutingState = new ConnectionState
+            {
+                Status = ConnectionStatus.Error,
+                ActiveProxy = profile,
+                Mode = ConnectionMode.WholeComputer,
+                RoutingStatus = routingStatus,
+                StatusMessage = "Could not start Whole Computer routing. Normal Windows networking was left untouched."
+            };
+            _logger.Warning("ConnectionManager", $"Whole Computer routing failed to start (status={routingStatus}) for '{profile.Name}'.");
+            SetState(failedRoutingState);
+            return failedRoutingState;
+        }
+
+        // Routing reports Active, but that only proves the WinDivert handles
+        // opened successfully - it does NOT prove real traffic actually
+        // flows through them end-to-end. Per the standing "no more
+        // IP-literal-only acceptance tests; no declaring Whole Computer
+        // verified until real hostname browsing works" mandate, the UI must
+        // never be told Connected until a real, hostname-addressed request
+        // has been proven to route through the now-Active pipeline. If that
+        // fails, roll routing back and report Error - never leave the router
+        // Active while telling the user (incorrectly) that verification
+        // failed but their traffic is still unprotected.
+        _logger.Info("ConnectionManager", $"Whole Computer routing reports Active for '{profile.Name}' - verifying with a real hostname-addressed request before reporting Connected.");
+
+        WholeComputerVerificationResult verification;
+        try
+        {
+            verification = await _wholeComputerVerifier.VerifyAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("ConnectionManager", "IWholeComputerConnectivityVerifier.VerifyAsync threw unexpectedly - treating as failed verification (fail-closed).", ex);
+            verification = WholeComputerVerificationResult.Failed("Verification threw unexpectedly.");
+        }
+
+        if (!verification.Success)
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer post-routing verification FAILED for '{profile.Name}': {verification.FailureMessage}.",
+                verification.FailureMessage ?? "Whole Computer routing could not be verified. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
+
+        // Success merely proving "some hostname-addressed HTTPS request
+        // reached the Internet" is NOT sufficient - a direct-bypass leak
+        // (the request escaping WinDivert interception and going straight
+        // out the real NIC/ISP path instead of through the residential
+        // proxy) would ALSO produce a successful, valid-looking response.
+        // For a dedicated static residential proxy product, the observed
+        // egress IP from THIS verification request must match the exit IP
+        // the earlier direct IProxyConnectivityTester pass already proved
+        // belongs to the selected proxy (result.ObservedPublicIp) - if it
+        // doesn't (or either IP is missing/unparseable), routing must be
+        // rolled back and reported as a failure, never silently accepted
+        // as "Connected" just because SOME public IP came back. IPs are
+        // compared as parsed System.Net.IPAddress values (not raw strings)
+        // so formatting differences (leading zeros, IPv4-mapped IPv6, etc.)
+        // never cause a false mismatch or a false match.
+        if (!TryParseIp(result.ObservedPublicIp, out var expectedProxyIp))
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer proxy-egress verification FAILED for '{profile.Name}': the earlier direct proxy connectivity test did not yield a parseable public IP ('{result.ObservedPublicIp}').",
+                "Could not establish the expected proxy egress IP from the initial connectivity test. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
+
+        if (!TryParseIp(verification.ObservedPublicIp, out var actualEgressIp))
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer proxy-egress verification FAILED for '{profile.Name}': the post-routing hostname verification request did not return a parseable public IP ('{verification.ObservedPublicIp}').",
+                "Internet access worked, but the observed egress IP could not be determined, so it could not be confirmed to be the selected proxy's IP. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
+
+        if (!expectedProxyIp.Equals(actualEgressIp))
+        {
+            var failureState = await RollBackWithErrorAsync(
+                profile,
+                $"Whole Computer proxy-egress verification FAILED for '{profile.Name}': expected proxy exit IP '{expectedProxyIp}' but the routed hostname request egressed as '{actualEgressIp}' - possible direct-bypass leak (traffic reached the Internet WITHOUT going through the selected proxy). Rolling routing back.",
+                $"Internet access worked, but egress did not match the selected proxy (expected {expectedProxyIp}, observed {actualEgressIp}). This indicates a possible direct-bypass leak. Routing has been rolled back.",
+                cancellationToken).ConfigureAwait(false);
+            return failureState;
+        }
+
+        var activeState = new ConnectionState
+        {
+            Status = ConnectionStatus.Connected,
+            ActiveProxy = profile,
+            Mode = ConnectionMode.WholeComputer,
+            RoutingStatus = SystemRoutingStatus.Active,
+            PublicIp = actualEgressIp.ToString(),
+            Latency = result.Latency,
+            StatusMessage = "Connected (Whole Computer)"
+        };
+        _logger.Info("ConnectionManager", $"Whole Computer routing active and VERIFIED for '{profile.Name}' - proxy egress IP {actualEgressIp} confirmed via hostname-addressed request.");
+        SetState(activeState);
+        return activeState;
     }
 
-    public Task DisconnectAsync(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Unsubscribes from routing-status events, stops (rolls back) an
+    /// already-Active <see cref="ISystemTrafficRouter"/>, logs, sets, and
+    /// returns an <see cref="ConnectionStatus.Error"/> state - the single
+    /// shared rollback path used by every post-Active verification failure
+    /// (verification itself failing, an unparseable expected/actual egress
+    /// IP, or an egress IP mismatch) so the UI is never told Connected
+    /// while routing is left dangling in an unverified Active state.
+    /// </summary>
+    private async Task<ConnectionState> RollBackWithErrorAsync(
+        ProxyProfile profile,
+        string logMessage,
+        string userMessage,
+        CancellationToken cancellationToken)
+    {
+        _trafficRouter!.StatusChanged -= OnRoutingStatusChanged;
+        _logger.Warning("ConnectionManager", logMessage);
+
+        try
+        {
+            await _trafficRouter.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("ConnectionManager", "Error stopping whole-computer routing during verification-failure rollback.", ex);
+        }
+
+        var failedState = new ConnectionState
+        {
+            Status = ConnectionStatus.Error,
+            ActiveProxy = profile,
+            Mode = ConnectionMode.WholeComputer,
+            RoutingStatus = SystemRoutingStatus.Unavailable,
+            StatusMessage = userMessage
+        };
+        SetState(failedState);
+        return failedState;
+    }
+
+    /// <summary>
+    /// Parses <paramref name="ipText"/> into an <see cref="IPAddress"/> for
+    /// comparison purposes. Deliberately used instead of raw string
+    /// equality for the proxy-egress-match check so textual formatting
+    /// differences (e.g. leading zeros in an octet) never cause a false
+    /// mismatch, and so a missing/malformed value is treated as "cannot
+    /// confirm" (fails closed) rather than silently comparing empty/garbage
+    /// strings.
+    /// </summary>
+    private static bool TryParseIp(string? ipText, out IPAddress address)
+    {
+        if (string.IsNullOrWhiteSpace(ipText))
+        {
+            address = IPAddress.None;
+            return false;
+        }
+
+        return IPAddress.TryParse(ipText.Trim(), out address!);
+    }
+
+    public async Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
         _logger.Info("ConnectionManager", "DISCONNECT requested.");
+
+        var wasWholeComputer = CurrentState.Mode == ConnectionMode.WholeComputer;
+
+        if (_trafficRouter is not null && wasWholeComputer)
+        {
+            _trafficRouter.StatusChanged -= OnRoutingStatusChanged;
+            try
+            {
+                await _trafficRouter.StopAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("ConnectionManager", "Error stopping whole-computer routing during DISCONNECT.", ex);
+            }
+        }
+
         SetState(ConnectionState.Idle);
-        return Task.CompletedTask;
+    }
+
+    private void OnRoutingStatusChanged(object? sender, SystemRoutingStatus status)
+    {
+        // Reflects an asynchronous routing-status transition (in particular
+        // FailedClosed, if the relay/upstream tunnel dies while Whole
+        // Computer mode is already Active) into the UI-facing ConnectionState
+        // without changing Status away from Connected - the fail-closed
+        // packet drop is already happening at the routing layer; this just
+        // makes it visible.
+        lock (_lock)
+        {
+            if (_currentState.Mode != ConnectionMode.WholeComputer)
+            {
+                return;
+            }
+
+            var updated = new ConnectionState
+            {
+                Status = status == SystemRoutingStatus.FailedClosed ? ConnectionStatus.Error : _currentState.Status,
+                ActiveProxy = _currentState.ActiveProxy,
+                Mode = _currentState.Mode,
+                RoutingStatus = status,
+                PublicIp = _currentState.PublicIp,
+                Latency = _currentState.Latency,
+                StatusMessage = status == SystemRoutingStatus.FailedClosed
+                    ? "Whole Computer routing failed - traffic is being blocked (fail-closed), not sent unprotected. Disconnect and retry."
+                    : _currentState.StatusMessage
+            };
+            _currentState = updated;
+            StateChanged?.Invoke(this, updated);
+        }
     }
 
     private void SetState(ConnectionState state)

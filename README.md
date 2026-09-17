@@ -140,6 +140,30 @@ connectivity, called out here so they're not mistaken for oversights:
   from Webshare's CSV export) and only cross-checks the observed public IP
   against the configured host when that host is itself a bare IP literal.
 
+## Known limitations for V0.2 (Whole Computer mode)
+
+Whole Computer mode (`ISystemTrafficRouter` / WinDivert-based system-wide
+routing) currently proxies **TCP only** — see `docs/ARCHITECTURE.md`
+"Whole Computer mode (V0.2): TCP-only proxying, fail-closed UDP" for the
+full rationale. In short:
+
+- **HTTP CONNECT is TCP-only.** The current Residential Connect **SOCKS5
+  implementation uses TCP CONNECT only; SOCKS5 UDP ASSOCIATE is not
+  implemented.** There is therefore no upstream path that can carry a
+  redirected UDP packet through the residential proxy today.
+- Rather than let unroutable UDP leak outside the proxy, **all outbound
+  UDP is fail-closed while Whole Computer mode is Active** — blocked
+  rather than allowed to reach the real network directly:
+  - **UDP/53 (DNS)** is handled by the existing DNS-block WinDivert Drop
+    handle.
+  - **Every other UDP packet** is handled by a separate, additive general
+    UDP-block WinDivert Drop handle.
+- **Practical consequence**: UDP-only applications — some games, VoIP
+  clients, and other real-time UDP-based software — may not function while
+  Whole Computer mode is Active, since their traffic is blocked rather
+  than routed. This is an explicit, documented trade-off (fail-closed over
+  silently leaking), not an oversight.
+
 ## License / usage
 
 Internal MVP for a commercial connectivity product. See your organization's

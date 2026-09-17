@@ -1,6 +1,7 @@
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
+using ResidentialConnect.Core.Diagnostics;
 
 namespace ResidentialConnect.Proxy.Forwarding;
 
@@ -12,17 +13,21 @@ namespace ResidentialConnect.Proxy.Forwarding;
 /// </summary>
 public sealed class HttpConnectUpstreamConnector : IUpstreamConnector
 {
+    private static readonly bool DiagnosticsEnabled = Environment.GetEnvironmentVariable("RESIDENTIALCONNECT_ROUTING_DIAGNOSTICS") == "1";
+
     private readonly string _proxyHost;
     private readonly int _proxyPort;
     private readonly string _username;
     private readonly string _password;
+    private readonly IAppLogger? _logger;
 
-    public HttpConnectUpstreamConnector(string proxyHost, int proxyPort, string username, string password)
+    public HttpConnectUpstreamConnector(string proxyHost, int proxyPort, string username, string password, IAppLogger? logger = null)
     {
         _proxyHost = proxyHost;
         _proxyPort = proxyPort;
         _username = username;
         _password = password;
+        _logger = logger;
     }
 
     public async Task<TcpClient> ConnectAsync(string targetHost, int targetPort, CancellationToken cancellationToken)
@@ -51,6 +56,15 @@ public sealed class HttpConnectUpstreamConnector : IUpstreamConnector
             {
                 line = await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
             } while (!string.IsNullOrEmpty(line));
+
+            // Diagnostic-only: log the CONNECT status line (never the
+            // Proxy-Authorization header/credentials, which are never even
+            // touched here). The IAppLogger pipeline also runs everything
+            // through SecretScrubber as defense in depth.
+            if (DiagnosticsEnabled)
+            {
+                _logger?.Debug("RoutingDiagnostics", $"[t={DiagnosticClock.ElapsedMs}ms] Upstream CONNECT {targetHost}:{targetPort} via {_proxyHost}:{_proxyPort} -> status line: \"{statusLine}\"");
+            }
 
             if (!statusLine.Contains(" 200"))
             {

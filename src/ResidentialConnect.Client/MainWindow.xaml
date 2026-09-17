@@ -1,10 +1,12 @@
 <Window x:Class="ResidentialConnect.Client.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Residential Connect" Height="420" Width="460"
+        Title="Residential Connect" Height="480" Width="460"
         WindowStartupLocation="CenterScreen" ResizeMode="CanMinimize">
     <Grid Margin="24">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -23,13 +25,26 @@
             </StackPanel>
         </StackPanel>
 
-        <TextBlock x:Name="StatusText" Grid.Row="1" Text="Status: Ready" FontSize="14"
-                   HorizontalAlignment="Center" Margin="0,10,0,10"/>
+        <!-- V0.2: connection mode selector. Browser Only (default) is exactly
+             V0.1's behavior; Whole Computer additionally routes ordinary
+             Windows desktop applications' TCP traffic through the proxy and
+             requires the app to be running elevated (Administrator). -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,4,0,4">
+            <RadioButton x:Name="BrowserOnlyRadio" Content="Browser Only" GroupName="ConnectionMode"
+                         IsChecked="True" Margin="0,0,16,0" Checked="ModeRadio_Checked"/>
+            <RadioButton x:Name="WholeComputerRadio" Content="Whole Computer" GroupName="ConnectionMode"
+                         Checked="ModeRadio_Checked"/>
+        </StackPanel>
+        <TextBlock x:Name="ModeHintText" Grid.Row="2" Text="" FontSize="11" Foreground="DarkOrange"
+                   HorizontalAlignment="Center" TextWrapping="Wrap" Margin="0,0,0,6"/>
 
-        <Button x:Name="ConnectButton" Grid.Row="2" Content="CONNECT" Height="52" FontSize="18" FontWeight="Bold"
+        <TextBlock x:Name="StatusText" Grid.Row="3" Text="Status: Ready" FontSize="14"
+                   HorizontalAlignment="Center" Margin="0,4,0,10"/>
+
+        <Button x:Name="ConnectButton" Grid.Row="4" Content="CONNECT" Height="52" FontSize="18" FontWeight="Bold"
                 Click="ConnectButton_Click" Margin="0,0,0,14"/>
 
-        <Grid Grid.Row="3" Margin="0,0,0,6">
+        <Grid Grid.Row="5" Margin="0,0,0,6">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="*"/>
@@ -44,13 +59,13 @@
             </StackPanel>
         </Grid>
 
-        <Button x:Name="OpenBrowserButton" Grid.Row="4" Content="OPEN BROWSER" Height="40" FontSize="14"
+        <Button x:Name="OpenBrowserButton" Grid.Row="6" Content="OPEN SEPARATE BROWSER WITH RESIDENTIAL IP" Height="40" FontSize="14"
                 Click="OpenBrowserButton_Click" Margin="0,10,0,10" IsEnabled="False"/>
 
-        <ComboBox x:Name="ProxyComboBox" Grid.Row="5" Height="30" Margin="0,0,0,10"
+        <ComboBox x:Name="ProxyComboBox" Grid.Row="7" Height="30" Margin="0,0,0,10"
                   SelectionChanged="ProxyComboBox_SelectionChanged" DisplayMemberPath="Name"/>
 
-        <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Center">
+        <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Center">
             <Button x:Name="ManageProxiesButton" Content="Settings / Manage Proxies" Padding="10,4"
                     Click="ManageProxiesButton_Click"/>
         </StackPanel>

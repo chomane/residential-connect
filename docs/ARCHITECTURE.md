@@ -190,6 +190,50 @@ documented as a temporary implementation of that interface.
 (`ProxyProtocol.Http` / `.Socks5`); adding a third transport later is an
 enum + factory-branch change, not a redesign.
 
+## Whole Computer mode (V0.2): TCP-only proxying, fail-closed UDP
+
+`ISystemTrafficRouter` / `WinDivertSystemTrafficRouter` (see that class's
+own extensive remarks for the WinDivert reflection mechanics) currently
+proxies **TCP only**. This is a deliberate, documented scope boundary, not
+an oversight:
+
+- **HTTP CONNECT is TCP-only** by definition — there is no HTTP CONNECT
+  equivalent for UDP.
+- The current Residential Connect **SOCKS5 implementation
+  (`Socks5UpstreamConnector`) uses TCP CONNECT only; SOCKS5 UDP ASSOCIATE
+  (RFC 1928 ss4) is not implemented.**
+
+Given that, there is presently no upstream path capable of carrying a
+redirected UDP packet through the residential proxy at all. Rather than
+leave outbound UDP unhandled (a silent leak — the traffic would reach the
+real network directly while the UI reports Whole Computer mode "Active"),
+V0.2 makes **all outbound UDP fail-closed while Active**:
+
+- **UDP/53 (DNS)** is handled by the existing DNS-block WinDivert Drop
+  handle (`BypassFilterBuilder.BuildDnsFilter` / `DnsLeakGuard`) — plain DNS
+  queries are dropped in-kernel rather than resolving over the real,
+  non-proxied network.
+- **Every other outbound UDP packet** is handled by the newer, separate,
+  purely additive general UDP-block WinDivert Drop handle
+  (`BypassFilterBuilder.BuildUdpBlockFilter`) — this covers protocols like
+  QUIC/HTTP-3 (UDP/443), WebRTC/STUN, and any other UDP-based application
+  traffic that would otherwise bypass the proxy silently.
+
+Both are separate, non-overlapping `WinDivertNative.OpenFlags.Drop` handles
+(the UDP-block filter explicitly excludes port 53, which the DNS-block
+handle already owns) — entirely in-kernel, fail-closed, and with no capture
+loop/thread of their own, exactly like the DNS-block handle they sit
+alongside.
+
+**Practical consequence:** UDP-only applications — some games, VoIP
+clients, and other real-time UDP-based software — may not function (or may
+silently lose connectivity) while Whole Computer mode is Active, since
+their traffic is blocked rather than routed. This is the same
+fail-closed-over-leaking trade-off already made for DNS, extended
+consistently to UDP as a whole; it is a real, documented limitation of this
+V0.2 TCP-only architecture, not a hidden gap. See also README → "Known
+limitations".
+
 ## Testing strategy
 
 `tests/ResidentialConnect.Tests` (xUnit) covers exactly the areas called

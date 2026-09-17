@@ -22,6 +22,10 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
     private IUpstreamConnector? _connector;
+    // Only the accept loop writes this collection. Stop awaits that loop
+    // before draining it, including connections still reading request headers.
+    private readonly List<Task> _clients = new();
+    private readonly SemaphoreSlim _stopLock = new(1, 1);
 
     public LocalForwardingProxy(IAppLogger logger)
     {
@@ -49,7 +53,8 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
         _cts = new CancellationTokenSource();
         IsRunning = true;
 
-        _acceptLoop = Task.Run(() => AcceptLoopAsync(_cts.Token));
+        var token = _cts.Token;
+        _acceptLoop = Task.Run(() => AcceptLoopAsync(token));
 
         _logger.Info("LocalForwardingProxy", $"Local relay listening on 127.0.0.1:{Port} -> upstream {profile.Host}:{profile.Port} ({profile.Protocol}).");
         return Task.FromResult(Port.Value);
@@ -62,7 +67,8 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
             while (!cancellationToken.IsCancellationRequested)
             {
                 var client = await _listener!.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
-                _ = HandleClientAsync(client, cancellationToken);
+                _clients.RemoveAll(task => task.IsCompleted);
+                _clients.Add(HandleClientAsync(client, cancellationToken));
             }
         }
         catch (OperationCanceledException)
@@ -122,7 +128,7 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
         var okResponse = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
         await browserStream.WriteAsync(okResponse, cancellationToken).ConfigureAwait(false);
 
-        await RelayBidirectionalAsync(browserStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
+        await UpstreamRelayHelper.RelayBidirectionalAsync(browserStream, upstream.GetStream(), cancellationToken).ConfigureAwait(false);
     }
 
     private async Task HandlePlainHttpAsync(NetworkStream browserStream, RawHttpRequest request, CancellationToken cancellationToken)
@@ -133,41 +139,30 @@ public sealed class LocalForwardingProxy : ILocalForwardingProxy
         var upstreamStream = upstream.GetStream();
 
         await upstreamStream.WriteAsync(request.RawHeaderBytes, cancellationToken).ConfigureAwait(false);
-        await RelayBidirectionalAsync(browserStream, upstreamStream, cancellationToken).ConfigureAwait(false);
+        await UpstreamRelayHelper.RelayBidirectionalAsync(browserStream, upstreamStream, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task RelayBidirectionalAsync(NetworkStream a, NetworkStream b, CancellationToken cancellationToken)
+    public async Task StopAsync()
     {
-        var t1 = CopyAsync(a, b, cancellationToken);
-        var t2 = CopyAsync(b, a, cancellationToken);
-        await Task.WhenAny(t1, t2).ConfigureAwait(false);
-    }
-
-    private static async Task CopyAsync(NetworkStream from, NetworkStream to, CancellationToken cancellationToken)
-    {
+        await _stopLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            await from.CopyToAsync(to, 81920, cancellationToken).ConfigureAwait(false);
+            IsRunning = false;
+            _cts?.Cancel();
+            _listener?.Stop();
+            Port = null;
+            if (_acceptLoop is not null)
+                await _acceptLoop.ConfigureAwait(false);
+            await Task.WhenAll(_clients).ConfigureAwait(false);
+            _clients.Clear();
+            _acceptLoop = null;
+            _listener = null;
+            _connector = null;
+            _cts?.Dispose();
+            _cts = null;
         }
-        catch
-        {
-            // Connection closed by either side - normal end-of-session.
-        }
+        finally { _stopLock.Release(); }
     }
 
-    public Task StopAsync()
-    {
-        IsRunning = false;
-        _cts?.Cancel();
-        _listener?.Stop();
-        Port = null;
-        return Task.CompletedTask;
-    }
-
-    public void Dispose()
-    {
-        _cts?.Cancel();
-        _listener?.Stop();
-        _cts?.Dispose();
-    }
+    public void Dispose() => StopAsync().GetAwaiter().GetResult();
 }

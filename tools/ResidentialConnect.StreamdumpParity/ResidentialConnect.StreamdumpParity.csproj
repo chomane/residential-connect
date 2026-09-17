@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Minimal, ISOLATED "streamdump parity" diagnostic requested 2026-09-15
+    after the second production instrumentation run and the (unsuccessful)
+    dedicated-thread/queue-headroom fix.
+
+    Purpose: determine whether the official WinDivert streamdump.c
+    single-handle reflection algorithm can reliably complete a real TCP
+    3-way handshake on THIS Windows machine at all, completely independent
+    of Residential Connect's own production two-handle
+    (forward+return)/flow-table/relay/proxy architecture. See README.md in
+    this folder for the full rationale and how to interpret PASS/FAIL.
+
+    Deliberately has ZERO project references to
+    ResidentialConnect.Routing/.Proxy/.Core - it re-implements its own
+    minimal WinDivert P/Invoke layer from scratch (see WinDivertNative.cs in
+    this project) purely so this experiment is not silently coupled to (or
+    hiding a bug shared with) the production ABI/struct definitions. This
+    also serves as a second, independent re-verification of the
+    WINDIVERT_ADDRESS bit layout/offsets against the real WinDivert 2.2.2
+    windivert.h header.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ResidentialConnect.StreamdumpParity</AssemblyName>
+    <RootNamespace>ResidentialConnect.StreamdumpParity</RootNamespace>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <SelfContained>false</SelfContained>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Same official, unmodified WinDivert.dll/WinDivert64.sys binaries production uses. -->
+    <PackageReference Include="Native.WinDivert" Version="2.2.2" />
+  </ItemGroup>
+
+</Project>

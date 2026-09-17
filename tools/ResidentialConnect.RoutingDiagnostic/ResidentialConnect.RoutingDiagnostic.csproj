@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Headless, scriptable acceptance test for Whole Computer mode's WinDivert
+    reflection fix, PLUS (2026-09-16) the additive UDP/DNS leak-protection
+    checks (raw UDP/53 DNS probe before/while/after routing, and an
+    HTTP/3-over-QUIC probe while routing is Active). See README.md in this
+    folder for full usage and rationale. This is NOT part of the shipped
+    desktop app.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ResidentialConnect.RoutingDiagnostic</AssemblyName>
+    <RootNamespace>ResidentialConnect.RoutingDiagnostic</RootNamespace>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ResidentialConnect.Core\ResidentialConnect.Core.csproj" />
+    <ProjectReference Include="..\..\src\ResidentialConnect.Security\ResidentialConnect.Security.csproj" />
+    <ProjectReference Include="..\..\src\ResidentialConnect.Proxy\ResidentialConnect.Proxy.csproj" />
+    <ProjectReference Include="..\..\src\ResidentialConnect.Routing\ResidentialConnect.Routing.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,14 +1,16 @@
 using System.Windows;
 using ResidentialConnect.Core.Abstractions;
 using ResidentialConnect.Core.Common;
+using ResidentialConnect.Core.Diagnostics;
 using ResidentialConnect.Core.Models;
 
 namespace ResidentialConnect.Client;
 
 /// <summary>
 /// Main screen: shows the selected proxy's country/city/flag, connection
-/// status, current public IP, latency, and exposes CONNECT/DISCONNECT and
-/// OPEN BROWSER. All heavy lifting (proxy testing, browser launching) is
+/// status, current public IP, latency, and exposes the Browser Only / Whole
+/// Computer mode selector plus CONNECT/DISCONNECT and OPEN BROWSER. All heavy
+/// lifting (proxy testing, browser launching, whole-computer routing) is
 /// delegated to the Core abstractions injected via <see cref="App"/>'s
 /// composition root, keeping this code-behind a thin presentation layer.
 /// </summary>
@@ -17,20 +19,31 @@ public partial class MainWindow : Window
     private readonly IProxyRepository _repository;
     private readonly IConnectionManager _connectionManager;
     private readonly IBrowserLauncher _browserLauncher;
+    private readonly ISystemTrafficRouter? _trafficRouter;
 
     private ProxyProfile? _selectedProfile;
 
-    public MainWindow(IProxyRepository repository, IConnectionManager connectionManager, IBrowserLauncher browserLauncher)
+    public MainWindow(
+        IProxyRepository repository,
+        IConnectionManager connectionManager,
+        IBrowserLauncher browserLauncher,
+        ISystemTrafficRouter? trafficRouter = null)
     {
         InitializeComponent();
         _repository = repository;
         _connectionManager = connectionManager;
         _browserLauncher = browserLauncher;
+        _trafficRouter = trafficRouter;
 
         _connectionManager.StateChanged += (_, state) => Dispatcher.Invoke(() => RenderState(state));
 
         ReloadProxies();
+        UpdateModeHint();
     }
+
+    private ConnectionMode SelectedMode => WholeComputerRadio.IsChecked == true
+        ? ConnectionMode.WholeComputer
+        : ConnectionMode.BrowserOnly;
 
     private void ReloadProxies()
     {
@@ -69,12 +82,75 @@ public partial class MainWindow : Window
         ConnectButton.Content = state.Status == ConnectionStatus.Connected ? "DISCONNECT" : "CONNECT";
         ConnectButton.IsEnabled = state.Status is not (ConnectionStatus.Connecting or ConnectionStatus.Disconnecting);
         OpenBrowserButton.IsEnabled = state.Status == ConnectionStatus.Connected;
+
+        // Lock the mode selector while a connection is active/in-flight -
+        // switching modes mid-session is not supported; the user must
+        // DISCONNECT first (see docs/ARCHITECTURE.md "Mode switching").
+        var modeLocked = state.Status is ConnectionStatus.Connected or ConnectionStatus.Connecting or ConnectionStatus.Disconnecting;
+        BrowserOnlyRadio.IsEnabled = !modeLocked;
+        WholeComputerRadio.IsEnabled = !modeLocked && (_trafficRouter?.IsSupported ?? false);
+
+        if (state.Mode == ConnectionMode.WholeComputer && state.RoutingStatus == SystemRoutingStatus.FailedClosed)
+        {
+            ModeHintText.Text = "Whole Computer routing failed - traffic is being BLOCKED (fail-closed), not sent over your real connection. Disconnect and try again.";
+        }
+        else
+        {
+            UpdateModeHint();
+        }
+    }
+
+    private void ModeRadio_Checked(object sender, RoutedEventArgs e)
+    {
+        UpdateModeHint();
+    }
+
+    private void UpdateModeHint()
+    {
+        if (ModeHintText is null)
+        {
+            // Fires once during InitializeComponent, before the field
+            // assignment in the constructor completes - nothing to update yet.
+            return;
+        }
+
+        if (SelectedMode != ConnectionMode.WholeComputer)
+        {
+            ModeHintText.Text = "";
+            return;
+        }
+
+        if (_trafficRouter is null || !_trafficRouter.IsSupported)
+        {
+            ModeHintText.Text = "Whole Computer mode requires running Residential Connect as Administrator on Windows.";
+        }
+        else
+        {
+            ModeHintText.Text = "Whole Computer mode routes TCP applications through the selected residential IP. DNS is securely resolved through the proxy. Unsupported public UDP/QUIC traffic is blocked to prevent direct bypass.";
+        }
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
     {
         if (_connectionManager.CurrentState.Status == ConnectionStatus.Connected)
         {
+            if (_connectionManager.CurrentState.Mode == ConnectionMode.BrowserOnly)
+            {
+                ConnectButton.IsEnabled = false;
+                OpenBrowserButton.IsEnabled = false;
+                StatusText.Text = "Status: Disconnecting browser sessions...";
+                try
+                {
+                    await _browserLauncher.DisconnectAllAsync();
+                }
+                catch (Exception ex)
+                {
+                    App.Services.Logger.Error("BrowserLauncher", "Browser disconnect failed.", ex);
+                    MessageBox.Show(this, "Browser cleanup failed. See diagnostics log for details.", "Disconnect Failed");
+                    RenderState(_connectionManager.CurrentState);
+                    return;
+                }
+            }
             await _connectionManager.DisconnectAsync();
             return;
         }
@@ -85,7 +161,17 @@ public partial class MainWindow : Window
             return;
         }
 
-        await _connectionManager.ConnectAsync(_selectedProfile);
+        var mode = SelectedMode;
+        if (mode == ConnectionMode.WholeComputer && (_trafficRouter is null || !_trafficRouter.IsSupported))
+        {
+            MessageBox.Show(
+                this,
+                "Whole Computer mode requires running Residential Connect as Administrator on Windows. Restart the app elevated, or use Browser Only mode.",
+                "Whole Computer mode unavailable");
+            return;
+        }
+
+        await _connectionManager.ConnectAsync(_selectedProfile, mode);
     }
 
     private async void OpenBrowserButton_Click(object sender, RoutedEventArgs e)

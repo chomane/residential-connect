@@ -5,6 +5,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <!-- WinDivertSystemTrafficRouterTests intentionally exercises the
+         Windows-only router from this cross-platform test project (guarded
+         at runtime via OperatingSystem.IsWindows()) so the fail-closed /
+         IsSupported=false behavior is verified even on non-Windows CI. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -23,6 +28,7 @@
     <ProjectReference Include="..\..\src\ResidentialConnect.Security\ResidentialConnect.Security.csproj" />
     <ProjectReference Include="..\..\src\ResidentialConnect.Proxy\ResidentialConnect.Proxy.csproj" />
     <ProjectReference Include="..\..\src\ResidentialConnect.Browser\ResidentialConnect.Browser.csproj" />
+    <ProjectReference Include="..\..\src\ResidentialConnect.Routing\ResidentialConnect.Routing.csproj" />
   </ItemGroup>
 
 </Project>
