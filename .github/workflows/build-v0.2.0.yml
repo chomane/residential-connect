@@ -1,0 +1,81 @@
+name: Build Residential Connect v0.2.0
+
+on:
+  push:
+    branches:
+      - release/v0.2.0-build
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout verified merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: fff37fff1318a81c1f19f8f475e0df0551180c82
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore .\ResidentialConnect.sln
+
+      - name: Build Release
+        run: dotnet build .\ResidentialConnect.sln -c Release --no-restore -p:Version=0.2.0
+
+      - name: Run tests
+        run: dotnet test .\tests\ResidentialConnect.Tests\ResidentialConnect.Tests.csproj -c Release --no-build --logger "trx;LogFileName=v0.2.0-tests.trx"
+
+      - name: Publish self-contained Windows x64
+        run: dotnet publish .\src\ResidentialConnect.Client\ResidentialConnect.Client.csproj -c Release -r win-x64 --self-contained true -p:Version=0.2.0 -o .\publish\ResidentialConnect-v0.2.0-win-x64
+
+      - name: Verify required release files
+        shell: pwsh
+        run: |
+          $dir = ".\publish\ResidentialConnect-v0.2.0-win-x64"
+          $required = @(
+            "$dir\ResidentialConnect.exe",
+            "$dir\WinDivert.dll",
+            "$dir\WinDivert64.sys"
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) { throw "Missing required release file: $file" }
+          }
+
+      - name: Create release ZIP and checksums
+        shell: pwsh
+        run: |
+          $dir = ".\publish\ResidentialConnect-v0.2.0-win-x64"
+          $zip = ".\publish\ResidentialConnect-v0.2.0-win-x64.zip"
+          Compress-Archive -Path "$dir\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ResidentialConnect-v0.2.0-win-x64.zip" | Set-Content ".\publish\SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResidentialConnect-v0.2.0-win-x64
+          path: |
+            publish/ResidentialConnect-v0.2.0-win-x64.zip
+            publish/SHA256SUMS.txt
+            tests/ResidentialConnect.Tests/TestResults/v0.2.0-tests.trx
+          if-no-files-found: error
+
+      - name: Create draft GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete v0.2.0 --yes --cleanup-tag 2>$null; $LASTEXITCODE = 0
+          gh release create v0.2.0 `
+            ".\publish\ResidentialConnect-v0.2.0-win-x64.zip" `
+            ".\publish\SHA256SUMS.txt" `
+            --target fff37fff1318a81c1f19f8f475e0df0551180c82 `
+            --title "Residential Connect v0.2.0" `
+            --draft `
+            --notes "Windows x64 stable build from verified merge commit fff37fff1318a81c1f19f8f475e0df0551180c82. Browser Only and Whole Computer modes passed real-Windows acceptance testing. Public IPv6 blocking was not exercised live because the acceptance machine had no public IPv6."
