@@ -126,7 +126,7 @@ public partial class MainWindow : Window
         }
         else
         {
-            ModeHintText.Text = "Whole Computer mode routes ALL TCP applications (e.g. Telegram Desktop) through the selected proxy. TCP only - plain UDP (e.g. games, some DNS) is not proxied; DNS queries are blocked rather than leaked.";
+            ModeHintText.Text = "Whole Computer mode routes TCP applications through the selected residential IP. DNS is securely resolved through the proxy. Unsupported public UDP/QUIC traffic is blocked to prevent direct bypass.";
         }
     }
 
